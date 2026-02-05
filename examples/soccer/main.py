@@ -4,6 +4,7 @@ from typing import Iterator, List
 
 import os
 import cv2
+import tkinter as tk
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
@@ -134,13 +135,44 @@ def render_radar(
     keypoints: sv.KeyPoints,
     color_lookup: np.ndarray
 ) -> np.ndarray:
-    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-    transformer = ViewTransformer(
-        source=keypoints.xy[0][mask].astype(np.float32),
-        target=np.array(CONFIG.vertices)[mask].astype(np.float32)
-    )
-    xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-    transformed_xy = transformer.transform_points(points=xy)
+    
+    """
+    Create a radar view by transforming player positions onto a 2D pitch representation.
+    Only uses keypoints that are actually detected (confidence > 0.5 and within frame).
+    """
+    # Filter keypoints based on confidence and validity
+    # Keypoints at (0,0) or very low confidence are not detected
+    all_keypoints = keypoints.xy[0]
+    all_confidence = keypoints.confidence[0] if keypoints.confidence is not None else np.ones(len(all_keypoints))
+    
+    # Create mask for valid keypoints (detected with confidence > 0.5 and not at origin)
+    mask = (all_keypoints[:, 0] > 1) & (all_keypoints[:, 1] > 1) & (all_confidence > 0.5)
+    
+    # Need at least 4 points for homography
+    if np.sum(mask) < 4:
+        # If we don't have enough valid keypoints, return an empty pitch
+        return draw_pitch(config=CONFIG)
+    
+    # Filter source keypoints and corresponding target vertices
+    source_keypoints = all_keypoints[mask].astype(np.float32)
+    target_vertices = np.array(CONFIG.vertices)[mask].astype(np.float32)
+    
+    try:
+        transformer = ViewTransformer(
+            source=source_keypoints,
+            target=target_vertices
+        )
+        xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        transformed_xy = transformer.transform_points(points=xy)
+
+        # Clip transformed coordinates to stay within pitch bounds
+        # This prevents players from appearing outside the visible portion
+        transformed_xy[:, 0] = np.clip(transformed_xy[:, 0], 0, CONFIG.length)
+        transformed_xy[:, 1] = np.clip(transformed_xy[:, 1], 0, CONFIG.width)
+
+    except (ValueError, cv2.error):
+        # If homography fails, return empty pitch
+        return draw_pitch(config=CONFIG)
 
     radar = draw_pitch(config=CONFIG)
     radar = draw_points_on_pitch(
@@ -409,11 +441,30 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
+    
+    # Get screen resolution and calculate appropriate scale
+    root = tk.Tk()
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    root.destroy()
+    
+    # Use 90% of screen height to leave room for taskbar
+    max_display_height = int(screen_height * 0.9)
+    max_display_width = int(screen_width * 0.9)
+    
     with sv.VideoSink(target_video_path, video_info) as sink:
         for frame in frame_generator:
             sink.write_frame(frame)
 
-            cv2.imshow("frame", frame)
+            # Resize frame to fit screen
+            h, w = frame.shape[:2]
+            scale = min(max_display_width / w, max_display_height / h)
+            if scale < 1:
+                display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            else:
+                display_frame = frame
+            
+            cv2.imshow("frame", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
         cv2.destroyAllWindows()
