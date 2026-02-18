@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter, defaultdict, deque
 from enum import Enum
 from typing import Iterator, List
 
@@ -26,8 +27,30 @@ GOALKEEPER_CLASS_ID = 1
 PLAYER_CLASS_ID = 2
 REFEREE_CLASS_ID = 3
 
-STRIDE = 60
 CONFIG = SoccerPitchConfiguration()
+
+
+def compute_stride(source_video_path: str, min_samples: int = 8) -> int:
+    """Compute a stride that guarantees at least `min_samples` frames are sampled."""
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    total_frames = video_info.total_frames
+    stride = max(1, total_frames // min_samples)
+    return stride
+
+
+class TeamVoter:
+    """Majority-vote smoother keyed by ByteTrack tracker_id."""
+
+    def __init__(self, window: int = 20):
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
+
+    def update(self, tracker_ids: np.ndarray, team_ids: np.ndarray) -> np.ndarray:
+        smoothed = np.empty_like(team_ids)
+        for i, (tid, raw_team) in enumerate(zip(tracker_ids, team_ids)):
+            self.history[tid].append(int(raw_team))
+            counter = Counter(self.history[tid])
+            smoothed[i] = counter.most_common(1)[0][0]
+        return smoothed
 
 COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700']
 VERTEX_LABEL_ANNOTATOR = sv.VertexLabelAnnotator(
@@ -95,6 +118,20 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
         List[np.ndarray]: List of cropped images.
     """
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
+
+
+def get_jersey_crops(crops: List[np.ndarray]) -> List[np.ndarray]:
+    """
+    Slice each crop to the jersey region: top 40% height, middle 60% width.
+    """
+    jersey_crops = []
+    for crop in crops:
+        h, w = crop.shape[:2]
+        y_end = int(h * 0.4)
+        x_start = int(w * 0.2)
+        x_end = int(w * 0.8)
+        jersey_crops.append(crop[:y_end, x_start:x_end])
+    return jersey_crops
 
 
 def resolve_goalkeepers_team_id(
@@ -310,8 +347,9 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
+        source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -320,10 +358,11 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
     team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
+    team_classifier.fit(get_jersey_crops(crops))
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    voter = TeamVoter()
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -331,7 +370,8 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
+        players_team_id = team_classifier.predict(get_jersey_crops(crops))
+        players_team_id = voter.update(players.tracker_id, players_team_id)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -358,8 +398,9 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
+        source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -368,10 +409,11 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
     team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
+    team_classifier.fit(get_jersey_crops(crops))
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    voter = TeamVoter()
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -381,7 +423,8 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
+        players_team_id = team_classifier.predict(get_jersey_crops(crops))
+        players_team_id = voter.update(players.tracker_id, players_team_id)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
