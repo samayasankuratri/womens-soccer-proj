@@ -3,8 +3,8 @@ from typing import Generator, Iterable, List, TypeVar
 import numpy as np
 import supervision as sv
 import torch
-import umap
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 from transformers import AutoProcessor, SiglipVisionModel
 
@@ -56,7 +56,7 @@ class TeamClassifier:
         self.features_model = SiglipVisionModel.from_pretrained(
             SIGLIP_MODEL_PATH).to(device)
         self.processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
-        self.reducer = umap.UMAP(n_components=3)
+        self.reducer = PCA(n_components=3)
         self.cluster_model = KMeans(n_clusters=2)
 
     def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
