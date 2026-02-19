@@ -39,17 +39,40 @@ def compute_stride(source_video_path: str, min_samples: int = 8) -> int:
 
 
 class TeamVoter:
-    """Majority-vote smoother keyed by ByteTrack tracker_id."""
+    """Majority-vote smoother keyed by ByteTrack tracker_id.
 
-    def __init__(self, window: int = 20):
+    Once a tracker accumulates `lock_threshold` votes with at least
+    `lock_min_fraction` of them agreeing, the assignment is locked
+    permanently to eliminate flickering.
+    """
+
+    def __init__(
+        self,
+        window: int = 50,
+        lock_threshold: int = 30,
+        lock_min_fraction: float = 0.70,
+    ):
         self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
+        self.locked: dict[int, int] = {}
+        self.lock_threshold = lock_threshold
+        self.lock_min_fraction = lock_min_fraction
 
     def update(self, tracker_ids: np.ndarray, team_ids: np.ndarray) -> np.ndarray:
         smoothed = np.empty_like(team_ids)
         for i, (tid, raw_team) in enumerate(zip(tracker_ids, team_ids)):
+            if tid in self.locked:
+                smoothed[i] = self.locked[tid]
+                continue
             self.history[tid].append(int(raw_team))
             counter = Counter(self.history[tid])
-            smoothed[i] = counter.most_common(1)[0][0]
+            best, best_count = counter.most_common(1)[0]
+            smoothed[i] = best
+            # Lock once we have enough confident votes
+            if (
+                len(self.history[tid]) >= self.lock_threshold
+                and best_count / len(self.history[tid]) >= self.lock_min_fraction
+            ):
+                self.locked[tid] = best
         return smoothed
 
 COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700']
@@ -122,15 +145,19 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
 
 def get_jersey_crops(crops: List[np.ndarray]) -> List[np.ndarray]:
     """
-    Slice each crop to the jersey region: top 40% height, middle 60% width.
+    Slice each crop to the jersey torso region: rows 15-55%, columns 15-85%.
+    Skips the head/face at the top and legs/shorts at the bottom.
+    Falls back to the full crop if the slice is too small.
     """
     jersey_crops = []
     for crop in crops:
         h, w = crop.shape[:2]
-        y_end = int(h * 0.4)
-        x_start = int(w * 0.2)
-        x_end = int(w * 0.8)
-        jersey_crops.append(crop[:y_end, x_start:x_end])
+        y_start = int(h * 0.15)
+        y_end = int(h * 0.55)
+        x_start = int(w * 0.15)
+        x_end = int(w * 0.85)
+        sliced = crop[y_start:y_end, x_start:x_end]
+        jersey_crops.append(sliced if sliced.size > 0 else crop)
     return jersey_crops
 
 
