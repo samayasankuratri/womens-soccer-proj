@@ -155,3 +155,6 @@ Desktop.ini
 .Trash-**.pt
 *.mp4
 examples/soccer/data/*
+*.pt
+*.mp4
+examples/soccer/data/*
