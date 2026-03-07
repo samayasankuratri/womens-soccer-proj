@@ -152,4 +152,9 @@ Desktop.ini
 # Linux
 *~
 .directory
-.Trash-*
+.Trash-**.pt
+*.mp4
+examples/soccer/data/*
+*.pt
+*.mp4
+examples/soccer/data/*

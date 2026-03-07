@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter, defaultdict, deque
 from enum import Enum
 from typing import Iterator, List
 
@@ -25,6 +26,111 @@ BALL_CLASS_ID = 0
 GOALKEEPER_CLASS_ID = 1
 PLAYER_CLASS_ID = 2
 REFEREE_CLASS_ID = 3
+
+CONFIG = SoccerPitchConfiguration()
+
+
+def compute_stride(source_video_path: str, min_samples: int = 8) -> int:
+    """Compute a stride that guarantees at least `min_samples` frames are sampled."""
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    total_frames = video_info.total_frames
+    stride = max(1, total_frames // min_samples)
+    return stride
+
+
+class TeamVoter:
+    """Majority-vote smoother keyed by ByteTrack tracker_id.
+
+    Once a tracker accumulates `lock_threshold` votes with at least
+    `lock_min_fraction` of them agreeing, the assignment is locked
+    permanently to eliminate flickering.
+    """
+
+    def __init__(
+        self,
+        window: int = 50,
+        lock_threshold: int = 40,
+        lock_min_fraction: float = 0.82,
+    ):
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
+        self.locked: dict[int, int] = {}
+        self.lock_threshold = lock_threshold
+        self.lock_min_fraction = lock_min_fraction
+
+    def update(self, tracker_ids: np.ndarray, team_ids: np.ndarray) -> np.ndarray:
+        smoothed = np.empty_like(team_ids)
+        for i, (tid, raw_team) in enumerate(zip(tracker_ids, team_ids)):
+            if tid in self.locked:
+                smoothed[i] = self.locked[tid]
+                continue
+            self.history[tid].append(int(raw_team))
+            counter = Counter(self.history[tid])
+            best, best_count = counter.most_common(1)[0]
+            smoothed[i] = best
+            # Lock once we have enough confident votes
+            if (
+                len(self.history[tid]) >= self.lock_threshold
+                and best_count / len(self.history[tid]) >= self.lock_min_fraction
+            ):
+                self.locked[tid] = best
+        return smoothed
+
+class OutlierVoter:
+    """Per-tracker smoother for outlier (referee-like) detection.
+
+    Only flags a tracker as an outlier if at least `outlier_fraction` of its
+    recent frames were flagged as outliers, preventing a single bad crop from
+    misclassifying a real player as the center ref.
+    """
+
+    def __init__(self, window: int = 20, outlier_fraction: float = 0.7):
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
+        self.outlier_fraction = outlier_fraction
+
+    def update(self, tracker_ids: np.ndarray, outlier_mask: np.ndarray) -> np.ndarray:
+        result = np.zeros(len(tracker_ids), dtype=bool)
+        for i, (tid, is_outlier) in enumerate(zip(tracker_ids, outlier_mask)):
+            self.history[tid].append(bool(is_outlier))
+            fraction = sum(self.history[tid]) / len(self.history[tid])
+            result[i] = fraction >= self.outlier_fraction
+        return result
+
+
+class ClassVoter:
+    """Per-tracker majority-vote smoother for player vs. referee class assignment.
+
+    Prevents individual players from flickering between PLAYER_CLASS_ID and
+    REFEREE_CLASS_ID when detection confidence oscillates near the threshold.
+    """
+
+    def __init__(
+        self,
+        window: int = 30,
+        lock_threshold: int = 20,
+        lock_min_fraction: float = 0.80,
+    ):
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
+        self.locked: dict[int, int] = {}
+        self.lock_threshold = lock_threshold
+        self.lock_min_fraction = lock_min_fraction
+
+    def update(self, tracker_ids: np.ndarray, class_ids: np.ndarray) -> np.ndarray:
+        smoothed = class_ids.copy()
+        for i, (tid, raw_class) in enumerate(zip(tracker_ids, class_ids)):
+            if tid in self.locked:
+                smoothed[i] = self.locked[tid]
+                continue
+            self.history[tid].append(int(raw_class))
+            counter = Counter(self.history[tid])
+            best, best_count = counter.most_common(1)[0]
+            smoothed[i] = best
+            if (
+                len(self.history[tid]) >= self.lock_threshold
+                and best_count / len(self.history[tid]) >= self.lock_min_fraction
+            ):
+                self.locked[tid] = best
+        return smoothed
+
 
 STRIDE = 60
 CONFIG = SoccerPitchConfiguration()
@@ -81,6 +187,8 @@ class Mode(Enum):
     PLAYER_TRACKING = 'PLAYER_TRACKING'
     TEAM_CLASSIFICATION = 'TEAM_CLASSIFICATION'
     RADAR = 'RADAR'
+    REFEREE_DIAGNOSTIC = 'REFEREE_DIAGNOSTIC'
+    PLAYER_DIAGNOSTIC = 'PLAYER_DIAGNOSTIC'
 
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
@@ -95,6 +203,24 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
         List[np.ndarray]: List of cropped images.
     """
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
+
+
+def get_jersey_crops(crops: List[np.ndarray]) -> List[np.ndarray]:
+    """
+    Slice each crop to the jersey torso region: rows 15-55%, columns 15-85%.
+    Skips the head/face at the top and legs/shorts at the bottom.
+    Falls back to the full crop if the slice is too small.
+    """
+    jersey_crops = []
+    for crop in crops:
+        h, w = crop.shape[:2]
+        y_start = int(h * 0.15)
+        y_end = int(h * 0.55)
+        x_start = int(w * 0.15)
+        x_end = int(w * 0.85)
+        sliced = crop[y_start:y_end, x_start:x_end]
+        jersey_crops.append(sliced if sliced.size > 0 else crop)
+    return jersey_crops
 
 
 def resolve_goalkeepers_team_id(
@@ -188,6 +314,93 @@ def render_radar(
         config=CONFIG, xy=transformed_xy[color_lookup == 3],
         face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
     return radar
+
+
+def run_referee_diagnostic(source_video_path: str, device: str) -> None:
+    """
+    Sample frames and print confidence score statistics for all REFEREE_CLASS_ID
+    detections. Use this to find a good confidence threshold for reclassification.
+    """
+    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path, min_samples=30)
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=stride)
+
+    scores = []
+    for frame in tqdm(frame_generator, desc='scanning for referees'):
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        referee_mask = detections.class_id == REFEREE_CLASS_ID
+        scores.extend(detections.confidence[referee_mask].tolist())
+
+    if not scores:
+        print("No referee detections found in sampled frames.")
+        return
+
+    scores = np.array(scores)
+    percentiles = [10, 25, 50, 75, 90, 95]
+    print(f"\n--- Referee detection confidence scores ({len(scores)} detections) ---")
+    print(f"  min:  {scores.min():.3f}")
+    for p in percentiles:
+        print(f"  p{p:02d}:  {np.percentile(scores, p):.3f}")
+    print(f"  max:  {scores.max():.3f}")
+    print(f"  mean: {scores.mean():.3f}")
+
+    # ASCII histogram with 10 bins from 0.0 to 1.0
+    print("\n  Histogram (0.0 → 1.0):")
+    bin_edges = np.linspace(0.0, 1.0, 11)
+    counts, _ = np.histogram(scores, bins=bin_edges)
+    max_count = max(counts) if max(counts) > 0 else 1
+    bar_width = 30
+    for i, count in enumerate(counts):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        bar = '#' * int(count / max_count * bar_width)
+        marker = " <-- current threshold" if lo < 0.7 <= hi else ""
+        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<{bar_width}} {count}{marker}")
+    print()
+
+
+def run_player_diagnostic(source_video_path: str, device: str) -> None:
+    """
+    Sample frames and print confidence score statistics for all PLAYER_CLASS_ID
+    detections. Use this to find a good confidence threshold for crop collection.
+    """
+    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path, min_samples=30)
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=stride)
+
+    scores = []
+    for frame in tqdm(frame_generator, desc='scanning for players'):
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        player_mask = detections.class_id == PLAYER_CLASS_ID
+        scores.extend(detections.confidence[player_mask].tolist())
+
+    if not scores:
+        print("No player detections found in sampled frames.")
+        return
+
+    scores = np.array(scores)
+    percentiles = [10, 25, 50, 75, 90, 95]
+    print(f"\n--- Player detection confidence scores ({len(scores)} detections) ---")
+    print(f"  min:  {scores.min():.3f}")
+    for p in percentiles:
+        print(f"  p{p:02d}:  {np.percentile(scores, p):.3f}")
+    print(f"  max:  {scores.max():.3f}")
+    print(f"  mean: {scores.mean():.3f}")
+
+    print("\n  Histogram (0.0 → 1.0):")
+    bin_edges = np.linspace(0.0, 1.0, 11)
+    counts, _ = np.histogram(scores, bins=bin_edges)
+    max_count = max(counts) if max(counts) > 0 else 1
+    bar_width = 30
+    for i, count in enumerate(counts):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        bar = '#' * int(count / max_count * bar_width)
+        marker = " <-- current threshold" if lo < 0.8 <= hi else ""
+        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<{bar_width}} {count}{marker}")
+    print()
 
 
 def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
@@ -310,6 +523,9 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path, min_samples=8)
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=stride)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
 
@@ -317,6 +533,33 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     for frame in tqdm(frame_generator, desc='collecting crops'):
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
+        high_conf_players = detections[
+            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
+        ]
+        crops += get_crops(frame, high_conf_players)
+
+    team_classifier = TeamClassifier(device=device)
+    team_classifier.fit(get_jersey_crops(crops))
+
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    voter = TeamVoter()
+    class_voter = ClassVoter()
+    outlier_voter = OutlierVoter()
+    for frame in frame_generator:
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+
+        detections = tracker.update_with_detections(detections)
+        detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
+
+        players = detections[detections.class_id == PLAYER_CLASS_ID]
+        crops = get_crops(frame, players)
+        jersey_crops = get_jersey_crops(crops)
+        players_team_id = team_classifier.predict(jersey_crops)
+        raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
+        smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
+        players_team_id = voter.update(players.tracker_id, players_team_id)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
     team_classifier = TeamClassifier(device=device)
@@ -340,6 +583,14 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
+        player_colors = [
+            int(REFEREE_CLASS_ID) if smoothed_outlier_mask[i] else int(players_team_id[i])
+            for i in range(len(players_team_id))
+        ]
+        color_lookup = np.array(
+            player_colors +
+            goalkeepers_team_id.tolist() +
+            [REFEREE_CLASS_ID] * len(referees)
         color_lookup = np.array(
                 players_team_id.tolist() +
                 goalkeepers_team_id.tolist() +
@@ -358,6 +609,9 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    stride = compute_stride(source_video_path, min_samples=8)
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=stride)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
 
@@ -365,6 +619,19 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     for frame in tqdm(frame_generator, desc='collecting crops'):
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
+        high_conf_players = detections[
+            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
+        ]
+        crops += get_crops(frame, high_conf_players)
+
+    team_classifier = TeamClassifier(device=device)
+    team_classifier.fit(get_jersey_crops(crops))
+
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    voter = TeamVoter()
+    class_voter = ClassVoter()
+    outlier_voter = OutlierVoter()
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
     team_classifier = TeamClassifier(device=device)
@@ -377,6 +644,17 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         keypoints = sv.KeyPoints.from_ultralytics(result)
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
+
+        detections = tracker.update_with_detections(detections)
+        detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
+
+        players = detections[detections.class_id == PLAYER_CLASS_ID]
+        crops = get_crops(frame, players)
+        jersey_crops = get_jersey_crops(crops)
+        players_team_id = team_classifier.predict(jersey_crops)
+        raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
+        smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
+        players_team_id = voter.update(players.tracker_id, players_team_id)
         detections = tracker.update_with_detections(detections)
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
@@ -390,6 +668,12 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
+        player_colors = [
+            int(REFEREE_CLASS_ID) if smoothed_outlier_mask[i] else int(players_team_id[i])
+            for i in range(len(players_team_id))
+        ]
+        color_lookup = np.array(
+            player_colors +
         color_lookup = np.array(
             players_team_id.tolist() +
             goalkeepers_team_id.tolist() +
@@ -419,6 +703,13 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
 
 def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+    if mode == Mode.REFEREE_DIAGNOSTIC:
+        run_referee_diagnostic(source_video_path=source_video_path, device=device)
+        return
+    elif mode == Mode.PLAYER_DIAGNOSTIC:
+        run_player_diagnostic(source_video_path=source_video_path, device=device)
+        return
+    elif mode == Mode.PITCH_DETECTION:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)

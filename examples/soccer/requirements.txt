@@ -1,2 +1,5 @@
 ultralytics
 gdown
+supervision
+tqdm
+gdown
