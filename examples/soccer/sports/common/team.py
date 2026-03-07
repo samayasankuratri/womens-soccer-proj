@@ -13,6 +13,17 @@ V = TypeVar("V")
 # from tqdm import tqdm
 # from transformers import SiglipImageProcessor, SiglipVisionModel
 # SIGLIP_MODEL_PATH = 'google/siglip-base-patch16-224'
+import numpy as np
+import supervision as sv
+import torch
+import umap
+from sklearn.cluster import KMeans
+from tqdm import tqdm
+from transformers import AutoProcessor, SiglipVisionModel
+
+V = TypeVar("V")
+
+SIGLIP_MODEL_PATH = 'google/siglip-base-patch16-224'
 
 
 def create_batches(
@@ -50,6 +61,17 @@ class TeamClassifier:
       - Replace __init__ and extract_features with the originals below:
 
     def __init__(self, device: str = 'cpu', batch_size: int = 32):
+    A classifier that uses a pre-trained SiglipVisionModel for feature extraction,
+    UMAP for dimensionality reduction, and KMeans for clustering.
+    """
+    def __init__(self, device: str = 'cpu', batch_size: int = 32):
+        """
+       Initialize the TeamClassifier with device and batch size.
+
+       Args:
+           device (str): The device to run the model on ('cpu' or 'cuda').
+           batch_size (int): The batch size for processing images.
+       """
         self.device = device
         self.batch_size = batch_size
         self.features_model = SiglipVisionModel.from_pretrained(
@@ -59,6 +81,21 @@ class TeamClassifier:
         self.cluster_model = KMeans(n_clusters=2)
 
     def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
+        self.processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
+        self.reducer = umap.UMAP(n_components=3)
+        self.cluster_model = KMeans(n_clusters=2)
+
+    def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
+        """
+        Extract features from a list of image crops using the pre-trained
+            SiglipVisionModel.
+
+        Args:
+            crops (List[np.ndarray]): List of image crops.
+
+        Returns:
+            np.ndarray: Extracted features as a numpy array.
+        """
         crops = [sv.cv2_to_pillow(crop) for crop in crops]
         batches = create_batches(crops, self.batch_size)
         data = []
@@ -108,6 +145,32 @@ class TeamClassifier:
         self.outlier_threshold = dists.mean() + 2.5 * dists.std()
 
     def predict(self, crops: List[np.ndarray]) -> np.ndarray:
+                embeddings = torch.mean(outputs.last_hidden_state, dim=1).cpu().numpy()
+                data.append(embeddings)
+
+        return np.concatenate(data)
+
+    def fit(self, crops: List[np.ndarray]) -> None:
+        """
+        Fit the classifier model on a list of image crops.
+
+        Args:
+            crops (List[np.ndarray]): List of image crops.
+        """
+        data = self.extract_features(crops)
+        projections = self.reducer.fit_transform(data)
+        self.cluster_model.fit(projections)
+
+    def predict(self, crops: List[np.ndarray]) -> np.ndarray:
+        """
+        Predict the cluster labels for a list of image crops.
+
+        Args:
+            crops (List[np.ndarray]): List of image crops.
+
+        Returns:
+            np.ndarray: Predicted cluster labels.
+        """
         if len(crops) == 0:
             return np.array([])
 
