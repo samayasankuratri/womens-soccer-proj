@@ -259,60 +259,102 @@ def resolve_goalkeepers_team_id(
 def render_radar(
     detections: sv.Detections,
     keypoints: sv.KeyPoints,
-    color_lookup: np.ndarray
+    color_lookup: np.ndarray,
+    ball_detections: sv.Detections | None = None
 ) -> np.ndarray:
-    
     """
     Create a radar view by transforming player positions onto a 2D pitch representation.
+    Optionally projects the ball onto the radar as well.
     Only uses keypoints that are actually detected (confidence > 0.5 and within frame).
     """
     # Filter keypoints based on confidence and validity
-    # Keypoints at (0,0) or very low confidence are not detected
     all_keypoints = keypoints.xy[0]
-    all_confidence = keypoints.confidence[0] if keypoints.confidence is not None else np.ones(len(all_keypoints))
-    
-    # Create mask for valid keypoints (detected with confidence > 0.5 and not at origin)
-    mask = (all_keypoints[:, 0] > 1) & (all_keypoints[:, 1] > 1) & (all_confidence > 0.5)
-    
+    all_confidence = (
+        keypoints.confidence[0]
+        if keypoints.confidence is not None
+        else np.ones(len(all_keypoints))
+    )
+
+    # Valid keypoints: detected, confident, and not near origin
+    mask = (
+        (all_keypoints[:, 0] > 1) &
+        (all_keypoints[:, 1] > 1) &
+        (all_confidence > 0.5)
+    )
+
     # Need at least 4 points for homography
     if np.sum(mask) < 4:
-        # If we don't have enough valid keypoints, return an empty pitch
         return draw_pitch(config=CONFIG)
-    
-    # Filter source keypoints and corresponding target vertices
+
     source_keypoints = all_keypoints[mask].astype(np.float32)
     target_vertices = np.array(CONFIG.vertices)[mask].astype(np.float32)
-    
+
     try:
         transformer = ViewTransformer(
             source=source_keypoints,
             target=target_vertices
         )
+
+        # Transform players / goalkeepers / referees
         xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
         transformed_xy = transformer.transform_points(points=xy)
 
-        # Clip transformed coordinates to stay within pitch bounds
-        # This prevents players from appearing outside the visible portion
+        # Clip to pitch bounds
         transformed_xy[:, 0] = np.clip(transformed_xy[:, 0], 0, CONFIG.length)
         transformed_xy[:, 1] = np.clip(transformed_xy[:, 1], 0, CONFIG.width)
 
+        # Transform ball if present
+        transformed_ball_xy = None
+        if ball_detections is not None and len(ball_detections) > 0:
+            ball_xy = ball_detections.get_anchors_coordinates(anchor=sv.Position.CENTER)
+            transformed_ball_xy = transformer.transform_points(points=ball_xy)
+            transformed_ball_xy[:, 0] = np.clip(transformed_ball_xy[:, 0], 0, CONFIG.length)
+            transformed_ball_xy[:, 1] = np.clip(transformed_ball_xy[:, 1], 0, CONFIG.width)
+
     except (ValueError, cv2.error):
-        # If homography fails, return empty pitch
         return draw_pitch(config=CONFIG)
 
     radar = draw_pitch(config=CONFIG)
+
     radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 0],
-        face_color=sv.Color.from_hex(COLORS[0]), radius=20, pitch=radar)
+        config=CONFIG,
+        xy=transformed_xy[color_lookup == 0],
+        face_color=sv.Color.from_hex(COLORS[0]),
+        radius=20,
+        pitch=radar
+    )
     radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 1],
-        face_color=sv.Color.from_hex(COLORS[1]), radius=20, pitch=radar)
+        config=CONFIG,
+        xy=transformed_xy[color_lookup == 1],
+        face_color=sv.Color.from_hex(COLORS[1]),
+        radius=20,
+        pitch=radar
+    )
     radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 2],
-        face_color=sv.Color.from_hex(COLORS[2]), radius=20, pitch=radar)
+        config=CONFIG,
+        xy=transformed_xy[color_lookup == 2],
+        face_color=sv.Color.from_hex(COLORS[2]),
+        radius=20,
+        pitch=radar
+    )
     radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 3],
-        face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
+        config=CONFIG,
+        xy=transformed_xy[color_lookup == 3],
+        face_color=sv.Color.from_hex(COLORS[3]),
+        radius=20,
+        pitch=radar
+    )
+
+    # Draw ball on radar
+    if transformed_ball_xy is not None and len(transformed_ball_xy) > 0:
+        radar = draw_points_on_pitch(
+            config=CONFIG,
+            xy=transformed_ball_xy,
+            face_color=sv.Color.from_hex("#FFFFFF"),
+            radius=10,
+            pitch=radar
+        )
+
     return radar
 
 
@@ -466,7 +508,7 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
     def callback(image_slice: np.ndarray) -> sv.Detections:
-        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        result = ball_detection_model(image_slice, imgsz=960, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
     slicer = sv.InferenceSlicer(
@@ -511,22 +553,16 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
-
 def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
     Run team classification on a video and yield annotated frames with team colors.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+
     stride = compute_stride(source_video_path, min_samples=8)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+        source_path=source_video_path, stride=stride
+    )
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -545,6 +581,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     voter = TeamVoter()
     class_voter = ClassVoter()
     outlier_voter = OutlierVoter()
+
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -555,6 +592,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
         jersey_crops = get_jersey_crops(crops)
+
         players_team_id = team_classifier.predict(jersey_crops)
         raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
         smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
@@ -562,36 +600,57 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
+            players, players_team_id, goalkeepers
+        )
 
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
+
         player_colors = [
             int(REFEREE_CLASS_ID) if smoothed_outlier_mask[i] else int(players_team_id[i])
             for i in range(len(players_team_id))
         ]
+
         color_lookup = np.array(
             player_colors +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
+
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-            annotated_frame, detections, custom_color_lookup=color_lookup)
+            annotated_frame, detections, custom_color_lookup=color_lookup
+        )
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels, custom_color_lookup=color_lookup)
+            annotated_frame, detections, labels, custom_color_lookup=color_lookup
+        )
         yield annotated_frame
 
 
 def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    ball_tracker = BallTracker(buffer_size=20)
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+
+    def ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    ball_slicer = sv.InferenceSlicer(
+        callback=ball_callback,
+        slice_wh=(640, 640),
+    )
+
     stride = compute_stride(source_video_path, min_samples=8)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+        source_path=source_video_path, stride=stride
+    )
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -610,11 +669,16 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     voter = TeamVoter()
     class_voter = ClassVoter()
     outlier_voter = OutlierVoter()
+
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
+
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
+
+        ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
+        ball_detections = ball_tracker.update(ball_detections)
 
         detections = tracker.update_with_detections(detections)
         detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
@@ -622,6 +686,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
         jersey_crops = get_jersey_crops(crops)
+
         players_team_id = team_classifier.predict(jersey_crops)
         raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
         smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
@@ -629,39 +694,47 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
+            players, players_team_id, goalkeepers
+        )
 
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
+
         player_colors = [
             int(REFEREE_CLASS_ID) if smoothed_outlier_mask[i] else int(players_team_id[i])
             for i in range(len(players_team_id))
         ]
+
         color_lookup = np.array(
             player_colors +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
+
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-            annotated_frame, detections, custom_color_lookup=color_lookup)
+            annotated_frame, detections, custom_color_lookup=color_lookup
+        )
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels,
-            custom_color_lookup=color_lookup)
+            annotated_frame, detections, labels, custom_color_lookup=color_lookup
+        )
 
         h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup)
+        radar = render_radar(detections, keypoints, color_lookup, ball_detections)
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
+
         rect = sv.Rect(
             x=w // 2 - radar_w // 2,
             y=h - radar_h,
             width=radar_w,
             height=radar_h
         )
+
+        annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
         yield annotated_frame
 
@@ -673,8 +746,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
     elif mode == Mode.PLAYER_DIAGNOSTIC:
         run_player_diagnostic(source_video_path=source_video_path, device=device)
         return
-
-    if mode == Mode.PITCH_DETECTION:
+    elif mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
     elif mode == Mode.PLAYER_DETECTION:
@@ -696,17 +768,17 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
-
+    
     # Get screen resolution and calculate appropriate scale
     root = tk.Tk()
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     root.destroy()
-
+    
     # Use 90% of screen height to leave room for taskbar
     max_display_height = int(screen_height * 0.9)
     max_display_width = int(screen_width * 0.9)
-
+    
     with sv.VideoSink(target_video_path, video_info) as sink:
         for frame in frame_generator:
             sink.write_frame(frame)
@@ -718,7 +790,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
                 display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             else:
                 display_frame = frame
-
+            
             cv2.imshow("frame", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
