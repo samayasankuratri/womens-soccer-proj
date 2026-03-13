@@ -511,6 +511,7 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
+
 def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
     Run team classification on a video and yield annotated frames with team colors.
@@ -526,8 +527,6 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     stride = compute_stride(source_video_path, min_samples=8)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -560,21 +559,6 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
         smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
         players_team_id = voter.update(players.tracker_id, players_team_id)
-        crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
-
-    team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
-
-    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        detections = tracker.update_with_detections(detections)
-
-        players = detections[detections.class_id == PLAYER_CLASS_ID]
-        crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -591,10 +575,6 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
             player_colors +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
-        color_lookup = np.array(
-                players_team_id.tolist() +
-                goalkeepers_team_id.tolist() +
-                [REFEREE_CLASS_ID] * len(referees)
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
@@ -612,8 +592,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     stride = compute_stride(source_video_path, min_samples=8)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -632,13 +610,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     voter = TeamVoter()
     class_voter = ClassVoter()
     outlier_voter = OutlierVoter()
-        crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
-
-    team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
-
-    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -655,11 +626,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
         smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
         players_team_id = voter.update(players.tracker_id, players_team_id)
-        detections = tracker.update_with_detections(detections)
-
-        players = detections[detections.class_id == PLAYER_CLASS_ID]
-        crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -674,8 +640,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         ]
         color_lookup = np.array(
             player_colors +
-        color_lookup = np.array(
-            players_team_id.tolist() +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
@@ -709,7 +673,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
     elif mode == Mode.PLAYER_DIAGNOSTIC:
         run_player_diagnostic(source_video_path=source_video_path, device=device)
         return
-    elif mode == Mode.PITCH_DETECTION:
+
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -732,17 +696,17 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
-    
+
     # Get screen resolution and calculate appropriate scale
     root = tk.Tk()
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     root.destroy()
-    
+
     # Use 90% of screen height to leave room for taskbar
     max_display_height = int(screen_height * 0.9)
     max_display_width = int(screen_width * 0.9)
-    
+
     with sv.VideoSink(target_video_path, video_info) as sink:
         for frame in frame_generator:
             sink.write_frame(frame)
@@ -754,7 +718,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
                 display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             else:
                 display_frame = frame
-            
+
             cv2.imshow("frame", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
