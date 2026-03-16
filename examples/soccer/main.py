@@ -223,6 +223,42 @@ def get_jersey_crops(crops: List[np.ndarray]) -> List[np.ndarray]:
     return jersey_crops
 
 
+def collect_crops(
+    frame_generator,
+    player_detection_model,
+    max_per_frame_ratio: float = 2.0,
+) -> List[np.ndarray]:
+    """
+    Collect high-confidence player crops from a strided frame generator.
+
+    Caps each frame's contribution to 2x the per-frame average (2C) so that
+    a single crowded frame (e.g., a corner kick) can't dominate the training set.
+    """
+    all_frame_crops = []
+    for frame in tqdm(frame_generator, desc='collecting crops'):
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        high_conf_players = detections[
+            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
+        ]
+        all_frame_crops.append(get_crops(frame, high_conf_players))
+
+    if not all_frame_crops:
+        return []
+
+    total = sum(len(fc) for fc in all_frame_crops)
+    cap = max(1, int(total / len(all_frame_crops) * max_per_frame_ratio))
+
+    crops = []
+    for frame_crops in all_frame_crops:
+        if len(frame_crops) > cap:
+            idx = np.random.choice(len(frame_crops), cap, replace=False)
+            crops.extend([frame_crops[i] for i in idx])
+        else:
+            crops.extend(frame_crops)
+    return crops
+
+
 def resolve_goalkeepers_team_id(
     players: sv.Detections,
     players_team_id: np.array,
@@ -559,19 +595,12 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
 
-    stride = compute_stride(source_video_path, min_samples=8)
+    stride = compute_stride(source_video_path, min_samples=50)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride
     )
 
-    crops = []
-    for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        high_conf_players = detections[
-            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
-        ]
-        crops += get_crops(frame, high_conf_players)
+    crops = collect_crops(frame_generator, player_detection_model)
 
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(get_jersey_crops(crops))
@@ -647,19 +676,12 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         slice_wh=(640, 640),
     )
 
-    stride = compute_stride(source_video_path, min_samples=8)
+    stride = compute_stride(source_video_path, min_samples=50)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride
     )
 
-    crops = []
-    for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        high_conf_players = detections[
-            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
-        ]
-        crops += get_crops(frame, high_conf_players)
+    crops = collect_crops(frame_generator, player_detection_model)
 
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(get_jersey_crops(crops))

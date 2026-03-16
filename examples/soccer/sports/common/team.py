@@ -51,7 +51,7 @@ class TeamClassifier:
         self.device = device
         self.batch_size = batch_size
         self.reducer = PCA(n_components=3)
-        self.cluster_model = KMeans(n_clusters=2)
+        self.cluster_model = KMeans(n_clusters=2, n_init=20)
         self.outlier_threshold = float('inf')
 
     def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
@@ -67,8 +67,11 @@ class TeamClassifier:
         data = []
         for crop in crops:
             hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-            # Only use saturated pixels (jersey colors); ignore skin/grass/background
-            sat_mask = hsv[:, :, 1] > 40
+            # Otsu adaptive threshold on saturation — adjusts per-crop to lighting
+            _, sat_mask_img = cv2.threshold(
+                hsv[:, :, 1], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            sat_mask = sat_mask_img > 0
             if sat_mask.sum() < 10:
                 sat_mask = np.ones(hsv.shape[:2], dtype=bool)
             h_vals = hsv[:, :, 0][sat_mask]
