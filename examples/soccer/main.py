@@ -555,6 +555,8 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
     for frame in frame_generator:
         detections = slicer(frame).with_nms(threshold=0.1)
+        if detections.confidence is not None:
+            detections = detections[detections.confidence > 0.2]
         detections = ball_tracker.update(detections)
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
@@ -700,6 +702,8 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         detections = sv.Detections.from_ultralytics(result)
 
         ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
+        if ball_detections.confidence is not None:
+            ball_detections = ball_detections[ball_detections.confidence > 0.2]
         ball_detections = ball_tracker.update(ball_detections)
 
         detections = tracker.update_with_detections(detections)
