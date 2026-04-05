@@ -17,6 +17,8 @@ from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
 
+
+
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-player-detection.pt')
 PITCH_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-pitch-detection.pt')
@@ -187,6 +189,7 @@ class Mode(Enum):
     PLAYER_TRACKING = 'PLAYER_TRACKING'
     TEAM_CLASSIFICATION = 'TEAM_CLASSIFICATION'
     RADAR = 'RADAR'
+    AERIAL_DUEL = 'AERIAL_DUEL'
     REFEREE_DIAGNOSTIC = 'REFEREE_DIAGNOSTIC'
     PLAYER_DIAGNOSTIC = 'PLAYER_DIAGNOSTIC'
 
@@ -314,6 +317,101 @@ def render_radar(
         config=CONFIG, xy=transformed_xy[color_lookup == 3],
         face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
     return radar
+
+class AerialDuelDetector:
+    """
+    Detects an aerial duel when:
+    - the ball is airborne, and
+    - at least `min_players` players are close to the ball.
+    """
+
+    def __init__(self, proximity_threshold: float = 150.0, min_players: int = 2):
+        self.proximity_threshold = proximity_threshold
+        self.min_players = min_players
+
+    @staticmethod
+    def get_player_duel_points(detections: sv.Detections) -> np.ndarray:
+        """
+        Use an upper-body point instead of bottom-center so the distance check
+        better matches headers / aerial contests.
+        """
+        xyxy = detections.xyxy
+        x = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
+        y = xyxy[:, 1] + 0.25 * (xyxy[:, 3] - xyxy[:, 1])
+        return np.stack([x, y], axis=1)
+
+    def detect(
+        self,
+        ball_tracker: BallTracker,
+        players: sv.Detections,
+    ) -> tuple[bool, sv.Detections, np.ndarray | None]:
+        ball_center = ball_tracker.get_ball_center()
+        if ball_center is None:
+            return False, players[[]], None
+
+        if len(players) == 0:
+            return False, players[[]], ball_center
+
+        if not ball_tracker.is_airborne():
+            return False, players[[]], ball_center
+
+        player_points = self.get_player_duel_points(players)
+        distances = np.linalg.norm(player_points - ball_center, axis=1)
+        mask = distances <= self.proximity_threshold
+        involved = players[mask]
+
+        return len(involved) >= self.min_players, involved, ball_center
+    
+
+def annotate_aerial_duel(
+    frame: np.ndarray,
+    players_involved: sv.Detections,
+    ball_center: np.ndarray | None,
+) -> np.ndarray:
+    if ball_center is None or len(players_involved) == 0:
+        return frame
+
+    bx, by = map(int, ball_center)
+
+    # Ball marker
+    cv2.circle(frame, (bx, by), 8, (0, 255, 255), 2)
+
+    # Draw player boxes + IDs + line to ball
+    for i, xyxy in enumerate(players_involved.xyxy.astype(int)):
+        x1, y1, x2, y2 = xyxy
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+        track_id = None
+        if players_involved.tracker_id is not None and len(players_involved.tracker_id) > i:
+            track_id = players_involved.tracker_id[i]
+
+        label = f"AERIAL DUEL #{track_id}" if track_id is not None else "AERIAL DUEL"
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(y1 - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        px = int((x1 + x2) / 2)
+        py = int(y1 + 0.25 * (y2 - y1))
+        cv2.line(frame, (px, py), (bx, by), (0, 255, 255), 2)
+
+    cv2.putText(
+        frame,
+        "AERIAL DUEL",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 0, 255),
+        3,
+        cv2.LINE_AA,
+    )
+    return frame
 
 
 def run_referee_diagnostic(source_video_path: str, device: str) -> None:
@@ -470,8 +568,7 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         return sv.Detections.from_ultralytics(result)
 
     slicer = sv.InferenceSlicer(
-        callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        callback=ball_callback,
         slice_wh=(640, 640),
     )
 
@@ -510,7 +607,97 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
             annotated_frame, detections, labels=labels)
         yield annotated_frame
 
+def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+    """
+    Detect aerial duels by combining:
+    - airborne ball detection from BallTracker trajectory history
+    - nearby player tracking with ByteTrack
+    """
+    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
 
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    ball_tracker = BallTracker(
+        buffer_size=12,
+        min_airborne_frames=5,
+        vertical_threshold=4.0,
+        vertical_ratio_threshold=0.8,
+        consistency_ratio=0.6,
+    )
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    aerial_duel_detector = AerialDuelDetector(
+        proximity_threshold=150.0,
+        min_players=2,
+    )
+
+    def ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    slicer = sv.InferenceSlicer(
+        callback=ball_callback,
+        slice_wh=(640, 640),
+    )
+
+    for frame in frame_generator:
+        # --- players ---
+        player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        player_detections = sv.Detections.from_ultralytics(player_result)
+        player_detections = tracker.update_with_detections(player_detections)
+
+        # Keep only outfield players + goalkeepers for duel logic
+        players = player_detections[
+            (player_detections.class_id == PLAYER_CLASS_ID) |
+            (player_detections.class_id == GOALKEEPER_CLASS_ID)
+        ]
+
+        # --- ball ---
+        ball_detections = slicer(frame).with_nms(threshold=0.1)
+        ball_detections = ball_tracker.update(ball_detections)
+
+        # --- detect duel ---
+        is_duel, involved_players, ball_center = aerial_duel_detector.detect(
+            ball_tracker=ball_tracker,
+            players=players,
+        )
+
+        # --- annotate ---
+        annotated_frame = frame.copy()
+
+        if len(players) > 0:
+            labels = [str(tracker_id) for tracker_id in players.tracker_id]
+            annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, players)
+            annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
+                annotated_frame,
+                players,
+                labels=labels,
+            )
+
+        if len(ball_detections) > 0:
+            annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
+
+        airborne_text = "BALL IN AIR" if ball_tracker.is_airborne() else "BALL ON GROUND"
+        cv2.putText(
+            annotated_frame,
+            airborne_text,
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255) if ball_tracker.is_airborne() else (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        if is_duel:
+            annotated_frame = annotate_aerial_duel(
+                annotated_frame,
+                involved_players,
+                ball_center,
+            )
+
+        yield annotated_frame
 
 def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
@@ -685,6 +872,9 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.PLAYER_TRACKING:
         frame_generator = run_player_tracking(
+            source_video_path=source_video_path, device=device)
+    elif mode == Mode.AERIAL_DUEL:
+        frame_generator = run_aerial_duel(
             source_video_path=source_video_path, device=device)
     elif mode == Mode.TEAM_CLASSIFICATION:
         frame_generator = run_team_classification(

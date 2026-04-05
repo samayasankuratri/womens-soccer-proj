@@ -67,37 +67,87 @@ class BallAnnotator:
 
 class BallTracker:
     """
-    A class used to track a soccer ball's position across video frames.
-
-    The BallTracker class maintains a buffer of recent ball positions and uses this
-    buffer to predict the ball's position in the current frame by selecting the
-    detection closest to the average position (centroid) of the recent positions.
-
-    Attributes:
-        buffer (collections.deque): A deque buffer to store recent ball positions.
+    Tracks the soccer ball and determines if it is airborne using trajectory.
     """
-    def __init__(self, buffer_size: int = 10):
+
+    def __init__(
+        self,
+        buffer_size: int = 10,
+        min_airborne_frames: int = 5,
+        vertical_threshold: float = 4.0,
+        vertical_ratio_threshold: float = 0.8,
+        consistency_ratio: float = 0.6,
+    ):
+        from collections import deque
+        import numpy as np
+
         self.buffer = deque(maxlen=buffer_size)
 
+        self.min_airborne_frames = min_airborne_frames
+        self.vertical_threshold = vertical_threshold
+        self.vertical_ratio_threshold = vertical_ratio_threshold
+        self.consistency_ratio = consistency_ratio
+
     def update(self, detections: sv.Detections) -> sv.Detections:
-        """
-        Updates the buffer with new detections and returns the detection closest to the
-        centroid of recent positions.
-
-        Args:
-            detections (sv.Detections): The current frame's ball detections.
-
-        Returns:
-            sv.Detections: The detection closest to the centroid of recent positions.
-            If there are no detections, returns the input detections.
-        """
-        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
-        self.buffer.append(xy)
-
         if len(detections) == 0:
             return detections
 
-        centroid = np.mean(np.concatenate(self.buffer), axis=0)
-        distances = np.linalg.norm(xy - centroid, axis=1)
-        index = np.argmin(distances)
-        return detections[[index]]
+        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
+
+        if len(self.buffer) == 0:
+            index = 0
+        else:
+            centroid = np.mean(np.concatenate(self.buffer), axis=0)
+            distances = np.linalg.norm(xy - centroid, axis=1)
+            index = int(np.argmin(distances))
+
+        tracked = detections[[index]]
+        tracked_xy = tracked.get_anchors_coordinates(sv.Position.CENTER)
+
+        self.buffer.append(tracked_xy)
+        return tracked
+
+    def get_ball_center(self):
+        if len(self.buffer) == 0:
+            return None
+
+        latest = self.buffer[-1]
+        if len(latest) == 0:
+            return None
+
+        return latest[0]
+
+    def is_airborne(self) -> bool:
+        if len(self.buffer) < self.min_airborne_frames:
+            return False
+
+        pts = np.concatenate(self.buffer, axis=0)
+
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+
+        if len(dx) == 0 or len(dy) == 0:
+            return False
+
+        mean_abs_dx = np.mean(np.abs(dx))
+        mean_abs_dy = np.mean(np.abs(dy))
+
+        vertical_enough = mean_abs_dy > self.vertical_threshold
+        vertical_ratio = mean_abs_dy / (mean_abs_dx + 1e-6)
+        vertical_dominant = vertical_ratio > self.vertical_ratio_threshold
+
+        signs = np.sign(dy)
+        nonzero_signs = signs[signs != 0]
+
+        if len(nonzero_signs) == 0:
+            return False
+
+        dominant_sign = 1 if np.sum(nonzero_signs > 0) >= np.sum(nonzero_signs < 0) else -1
+        consistency = np.mean(nonzero_signs == dominant_sign)
+
+        consistent_motion = consistency >= self.consistency_ratio
+
+        return vertical_enough and vertical_dominant and consistent_motion
