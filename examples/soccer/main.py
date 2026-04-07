@@ -541,7 +541,7 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     ball_tracker = BallTracker(buffer_size=20)
-    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    ball_annotator = BallAnnotator(radius=10, buffer_size=10)
 
     def callback(image_slice: np.ndarray) -> sv.Detections:
         result = ball_detection_model(image_slice, imgsz=960, verbose=False)[0]
@@ -549,14 +549,15 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
     slicer = sv.InferenceSlicer(
         callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        overlap_filter_strategy=sv.OverlapFilter.NON_MAX_SUPPRESSION,
         slice_wh=(640, 640),
+        overlap_wh=(64, 64),
     )
 
     for frame in frame_generator:
-        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = slicer(frame).with_nms(threshold=0.3)
         if detections.confidence is not None:
-            detections = detections[detections.confidence > 0.2]
+            detections = detections[detections.confidence > 0.1]
         detections = ball_tracker.update(detections)
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
@@ -667,7 +668,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
     ball_tracker = BallTracker(buffer_size=20)
-    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    ball_annotator = BallAnnotator(radius=10, buffer_size=10)
 
     def ball_callback(image_slice: np.ndarray) -> sv.Detections:
         result = ball_detection_model(image_slice, imgsz=960, verbose=False)[0]
@@ -675,8 +676,9 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     ball_slicer = sv.InferenceSlicer(
         callback=ball_callback,
-        overlap_filter=sv.OverlapFilter.NONE,
+        overlap_filter_strategy=sv.OverlapFilter.NON_MAX_SUPPRESSION,
         slice_wh=(640, 640),
+        overlap_wh=(64, 64),
     )
 
     stride = compute_stride(source_video_path, min_samples=50)
@@ -702,7 +704,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
 
-        ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
+        ball_detections = ball_slicer(frame).with_nms(threshold=0.3)
         if ball_detections.confidence is not None:
             ball_detections = ball_detections[ball_detections.confidence > 0.1]
         ball_detections = ball_tracker.update(ball_detections)

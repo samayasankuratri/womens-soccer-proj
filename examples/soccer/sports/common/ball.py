@@ -91,13 +91,13 @@ class BallTracker:
             sv.Detections: The detection closest to the centroid of recent positions.
             If there are no detections, returns the input detections.
         """
-        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
-        self.buffer.append(xy)
-
         if len(detections) == 0:
             return detections
 
-        centroid = np.mean(np.concatenate(self.buffer), axis=0)
+        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
+        self.buffer.append(xy)
+
+        centroid = np.mean(np.concatenate(list(self.buffer)), axis=0)
         distances = np.linalg.norm(xy - centroid, axis=1)
         index = np.argmin(distances)
         return detections[[index]]
