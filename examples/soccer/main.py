@@ -670,11 +670,12 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
     def ball_callback(image_slice: np.ndarray) -> sv.Detections:
-        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        result = ball_detection_model(image_slice, imgsz=960, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
     ball_slicer = sv.InferenceSlicer(
         callback=ball_callback,
+        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
 
@@ -703,7 +704,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
         ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
         if ball_detections.confidence is not None:
-            ball_detections = ball_detections[ball_detections.confidence > 0.2]
+            ball_detections = ball_detections[ball_detections.confidence > 0.1]
         ball_detections = ball_tracker.update(ball_detections)
 
         detections = tracker.update_with_detections(detections)
