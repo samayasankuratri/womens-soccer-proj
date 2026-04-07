@@ -5,7 +5,7 @@ from typing import Iterator, List
 
 import os
 import cv2
-import tkinter as tk
+#import tkinter as tk
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
@@ -796,31 +796,36 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     
     # Get screen resolution and calculate appropriate scale
-    root = tk.Tk()
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    root.destroy()
+    # root = tk.Tk()
+    # screen_width = root.winfo_screenwidth()
+    # screen_height = root.winfo_screenheight()
+    # root.destroy()
     
-    # Use 90% of screen height to leave room for taskbar
-    max_display_height = int(screen_height * 0.9)
-    max_display_width = int(screen_width * 0.9)
+    # # Use 90% of screen height to leave room for taskbar
+    # max_display_height = int(screen_height * 0.9)
+    # max_display_width = int(screen_width * 0.9)
+    
+    # with sv.VideoSink(target_video_path, video_info) as sink:
+    #     for frame in frame_generator:
+    #         sink.write_frame(frame)
+
+    #         # Resize frame to fit screen
+    #         h, w = frame.shape[:2]
+    #         scale = min(max_display_width / w, max_display_height / h)
+    #         if scale < 1:
+    #             display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    #         else:
+    #             display_frame = frame
+            
+    #         cv2.imshow("frame", display_frame)
+    #         if cv2.waitKey(1) & 0xFF == ord("q"):
+    #             break
+    #     cv2.destroyAllWindows()
     
     with sv.VideoSink(target_video_path, video_info) as sink:
-        for frame in frame_generator:
-            sink.write_frame(frame)
-
-            # Resize frame to fit screen
-            h, w = frame.shape[:2]
-            scale = min(max_display_width / w, max_display_height / h)
-            if scale < 1:
-                display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            else:
-                display_frame = frame
-            
-            cv2.imshow("frame", display_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-        cv2.destroyAllWindows()
+      for frame in frame_generator:
+        # Directly write the frame to output, no display
+        sink.write_frame(frame)
 
 
 if __name__ == '__main__':
