@@ -675,7 +675,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     ball_slicer = sv.InferenceSlicer(
         callback=ball_callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        overlap_filter=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
 
