@@ -41,19 +41,7 @@ def compute_stride(source_video_path: str, min_samples: int = 8) -> int:
 
 
 class TeamVoter:
-    """Majority-vote smoother keyed by ByteTrack tracker_id.
-
-    Once a tracker accumulates `lock_threshold` votes with at least
-    `lock_min_fraction` of them agreeing, the assignment is locked
-    permanently to eliminate flickering.
-    """
-
-    def __init__(
-        self,
-        window: int = 50,
-        lock_threshold: int = 40,
-        lock_min_fraction: float = 0.82,
-    ):
+    def __init__(self, window: int = 50, lock_threshold: int = 40, lock_min_fraction: float = 0.82):
         self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
         self.locked: dict[int, int] = {}
         self.lock_threshold = lock_threshold
@@ -69,23 +57,13 @@ class TeamVoter:
             counter = Counter(self.history[tid])
             best, best_count = counter.most_common(1)[0]
             smoothed[i] = best
-            # Lock once we have enough confident votes
-            if (
-                len(self.history[tid]) >= self.lock_threshold
-                and best_count / len(self.history[tid]) >= self.lock_min_fraction
-            ):
+            if (len(self.history[tid]) >= self.lock_threshold
+                    and best_count / len(self.history[tid]) >= self.lock_min_fraction):
                 self.locked[tid] = best
         return smoothed
 
 
 class OutlierVoter:
-    """Per-tracker smoother for outlier (referee-like) detection.
-
-    Only flags a tracker as an outlier if at least `outlier_fraction` of its
-    recent frames were flagged as outliers, preventing a single bad crop from
-    misclassifying a real player as the center ref.
-    """
-
     def __init__(self, window: int = 20, outlier_fraction: float = 0.7):
         self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
         self.outlier_fraction = outlier_fraction
@@ -100,18 +78,7 @@ class OutlierVoter:
 
 
 class ClassVoter:
-    """Per-tracker majority-vote smoother for player vs. referee class assignment.
-
-    Prevents individual players from flickering between PLAYER_CLASS_ID and
-    REFEREE_CLASS_ID when detection confidence oscillates near the threshold.
-    """
-
-    def __init__(
-        self,
-        window: int = 30,
-        lock_threshold: int = 20,
-        lock_min_fraction: float = 0.80,
-    ):
+    def __init__(self, window: int = 30, lock_threshold: int = 20, lock_min_fraction: float = 0.80):
         self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=window))
         self.locked: dict[int, int] = {}
         self.lock_threshold = lock_threshold
@@ -127,10 +94,8 @@ class ClassVoter:
             counter = Counter(self.history[tid])
             best, best_count = counter.most_common(1)[0]
             smoothed[i] = best
-            if (
-                len(self.history[tid]) >= self.lock_threshold
-                and best_count / len(self.history[tid]) >= self.lock_min_fraction
-            ):
+            if (len(self.history[tid]) >= self.lock_threshold
+                    and best_count / len(self.history[tid]) >= self.lock_min_fraction):
                 self.locked[tid] = best
         return smoothed
 
@@ -181,9 +146,6 @@ ELLIPSE_LABEL_ANNOTATOR = sv.LabelAnnotator(
 
 
 class Mode(Enum):
-    """
-    Enum class representing different modes of operation for Soccer AI video analysis.
-    """
     PITCH_DETECTION = 'PITCH_DETECTION'
     PLAYER_DETECTION = 'PLAYER_DETECTION'
     BALL_DETECTION = 'BALL_DETECTION'
@@ -200,11 +162,6 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
 
 
 def get_jersey_crops(crops: List[np.ndarray]) -> List[np.ndarray]:
-    """
-    Slice each crop to the jersey torso region: rows 15-55%, columns 15-85%.
-    Skips the head/face at the top and legs/shorts at the bottom.
-    Falls back to the full crop if the slice is too small.
-    """
     jersey_crops = []
     for crop in crops:
         h, w = crop.shape[:2]
@@ -222,17 +179,12 @@ def resolve_goalkeepers_team_id(
     players_team_id: np.array,
     goalkeepers: sv.Detections
 ) -> np.ndarray:
-    """
-    Resolve the team IDs for detected goalkeepers based on the proximity to team
-    centroids. Guards against empty team arrays to avoid RuntimeWarning.
-    """
     goalkeepers_xy = goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
     players_xy = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 
     team_0_players = players_xy[players_team_id == 0]
     team_1_players = players_xy[players_team_id == 1]
 
-    # FIX: if either team has no players detected, fall back to team 0
     if len(team_0_players) == 0 or len(team_1_players) == 0:
         return np.zeros(len(goalkeepers_xy), dtype=int)
 
@@ -252,13 +204,8 @@ def render_radar(
     keypoints: sv.KeyPoints,
     color_lookup: np.ndarray
 ) -> np.ndarray:
-    """
-    Create a radar view by transforming player positions onto a 2D pitch representation.
-    Only uses keypoints that are actually detected (confidence > 0.5 and within frame).
-    """
     all_keypoints = keypoints.xy[0]
     all_confidence = keypoints.confidence[0] if keypoints.confidence is not None else np.ones(len(all_keypoints))
-
     mask = (all_keypoints[:, 0] > 1) & (all_keypoints[:, 1] > 1) & (all_confidence > 0.5)
 
     if np.sum(mask) < 4:
@@ -268,47 +215,43 @@ def render_radar(
     target_vertices = np.array(CONFIG.vertices)[mask].astype(np.float32)
 
     try:
-        transformer = ViewTransformer(
-            source=source_keypoints,
-            target=target_vertices
-        )
+        transformer = ViewTransformer(source=source_keypoints, target=target_vertices)
         xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
         transformed_xy = transformer.transform_points(points=xy)
-
         transformed_xy[:, 0] = np.clip(transformed_xy[:, 0], 0, CONFIG.length)
         transformed_xy[:, 1] = np.clip(transformed_xy[:, 1], 0, CONFIG.width)
-
     except (ValueError, cv2.error):
         return draw_pitch(config=CONFIG)
 
     radar = draw_pitch(config=CONFIG)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 0],
+    radar = draw_points_on_pitch(config=CONFIG, xy=transformed_xy[color_lookup == 0],
         face_color=sv.Color.from_hex(COLORS[0]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 1],
+    radar = draw_points_on_pitch(config=CONFIG, xy=transformed_xy[color_lookup == 1],
         face_color=sv.Color.from_hex(COLORS[1]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 2],
+    radar = draw_points_on_pitch(config=CONFIG, xy=transformed_xy[color_lookup == 2],
         face_color=sv.Color.from_hex(COLORS[2]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 3],
+    radar = draw_points_on_pitch(config=CONFIG, xy=transformed_xy[color_lookup == 3],
         face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
     return radar
 
 
 class AerialDuelDetector:
     """
-    Detects an aerial duel when:
-    - the ball is airborne, and
-    - at least `min_players` players are close to the ball.
+    Detects an aerial duel when ALL of:
+    - the ball is currently airborne
+    - at least `min_players` players are within `proximity_threshold` pixels of the ball
+    - proximity is measured to the player's upper body (head/chest) not feet
 
-    Includes a latch so a single frame drop doesn't kill the duel annotation.
+    `proximity_threshold` is intentionally tight (80px default) so only players
+    genuinely contesting the ball trigger a duel — not nearby bystanders.
+
+    A latch keeps the annotation alive for `latch_frames` frames after the
+    conditions drop out, to handle brief ball detection gaps.
     """
 
     def __init__(
         self,
-        proximity_threshold: float = 150.0,
+        proximity_threshold: float = 80.0,   # tight — only players right at the ball
         min_players: int = 2,
         latch_frames: int = 8,
     ):
@@ -319,10 +262,7 @@ class AerialDuelDetector:
 
     @staticmethod
     def get_player_duel_points(detections: sv.Detections) -> np.ndarray:
-        """
-        Use an upper-body point instead of bottom-center so the distance check
-        better matches headers / aerial contests.
-        """
+        """Upper-body point (head/chest) — better match for aerial headers."""
         xyxy = detections.xyxy
         x = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
         y = xyxy[:, 1] + 0.25 * (xyxy[:, 3] - xyxy[:, 1])
@@ -343,13 +283,18 @@ class AerialDuelDetector:
             self._latch_count = 0
             return False, players[[]], ball_center
 
+        # Only trigger if ball is actually airborne
+        if not ball_tracker.is_airborne():
+            self._latch_count = max(0, self._latch_count - 1)
+            return self._latch_count > 0, players[[]], ball_center
+
+        # Check which players are within the tight proximity threshold
         player_points = self.get_player_duel_points(players)
         distances = np.linalg.norm(player_points - ball_center, axis=1)
         mask = distances <= self.proximity_threshold
         involved = players[mask]
 
-        # FIX: relaxed thresholds — treat falling ball as still airborne
-        currently_dueling = ball_tracker.is_airborne() and len(involved) >= self.min_players
+        currently_dueling = len(involved) >= self.min_players
         if currently_dueling:
             self._latch_count = self.latch_frames
         else:
@@ -367,7 +312,6 @@ def annotate_aerial_duel(
         return frame
 
     bx, by = map(int, ball_center)
-
     cv2.circle(frame, (bx, by), 8, (0, 255, 255), 2)
 
     for i, xyxy in enumerate(players_involved.xyxy.astype(int)):
@@ -379,27 +323,22 @@ def annotate_aerial_duel(
             track_id = players_involved.tracker_id[i]
 
         label = f"AERIAL DUEL #{track_id}" if track_id is not None else "AERIAL DUEL"
-        cv2.putText(
-            frame, label, (x1, max(y1 - 10, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA,
-        )
+        cv2.putText(frame, label, (x1, max(y1 - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
 
         px = int((x1 + x2) / 2)
         py = int(y1 + 0.25 * (y2 - y1))
         cv2.line(frame, (px, py), (bx, by), (0, 255, 255), 2)
 
-    cv2.putText(
-        frame, "AERIAL DUEL", (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA,
-    )
+    cv2.putText(frame, "AERIAL DUEL", (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA)
     return frame
 
 
 def run_referee_diagnostic(source_video_path: str, device: str) -> None:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=30)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=stride)
 
     scores = []
     for frame in tqdm(frame_generator, desc='scanning for referees'):
@@ -413,32 +352,27 @@ def run_referee_diagnostic(source_video_path: str, device: str) -> None:
         return
 
     scores = np.array(scores)
-    percentiles = [10, 25, 50, 75, 90, 95]
     print(f"\n--- Referee detection confidence scores ({len(scores)} detections) ---")
-    print(f"  min:  {scores.min():.3f}")
-    for p in percentiles:
+    for p in [10, 25, 50, 75, 90, 95]:
         print(f"  p{p:02d}:  {np.percentile(scores, p):.3f}")
-    print(f"  max:  {scores.max():.3f}")
     print(f"  mean: {scores.mean():.3f}")
 
-    print("\n  Histogram (0.0 → 1.0):")
     bin_edges = np.linspace(0.0, 1.0, 11)
     counts, _ = np.histogram(scores, bins=bin_edges)
     max_count = max(counts) if max(counts) > 0 else 1
-    bar_width = 30
+    print("\n  Histogram (0.0 → 1.0):")
     for i, count in enumerate(counts):
         lo, hi = bin_edges[i], bin_edges[i + 1]
-        bar = '#' * int(count / max_count * bar_width)
+        bar = '#' * int(count / max_count * 30)
         marker = " <-- current threshold" if lo < 0.7 <= hi else ""
-        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<{bar_width}} {count}{marker}")
+        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<30} {count}{marker}")
     print()
 
 
 def run_player_diagnostic(source_video_path: str, device: str) -> None:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=30)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=stride)
 
     scores = []
     for frame in tqdm(frame_generator, desc='scanning for players'):
@@ -452,24 +386,20 @@ def run_player_diagnostic(source_video_path: str, device: str) -> None:
         return
 
     scores = np.array(scores)
-    percentiles = [10, 25, 50, 75, 90, 95]
     print(f"\n--- Player detection confidence scores ({len(scores)} detections) ---")
-    print(f"  min:  {scores.min():.3f}")
-    for p in percentiles:
+    for p in [10, 25, 50, 75, 90, 95]:
         print(f"  p{p:02d}:  {np.percentile(scores, p):.3f}")
-    print(f"  max:  {scores.max():.3f}")
     print(f"  mean: {scores.mean():.3f}")
 
-    print("\n  Histogram (0.0 → 1.0):")
     bin_edges = np.linspace(0.0, 1.0, 11)
     counts, _ = np.histogram(scores, bins=bin_edges)
     max_count = max(counts) if max(counts) > 0 else 1
-    bar_width = 30
+    print("\n  Histogram (0.0 → 1.0):")
     for i, count in enumerate(counts):
         lo, hi = bin_edges[i], bin_edges[i + 1]
-        bar = '#' * int(count / max_count * bar_width)
+        bar = '#' * int(count / max_count * 30)
         marker = " <-- current threshold" if lo < 0.8 <= hi else ""
-        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<{bar_width}} {count}{marker}")
+        print(f"  [{lo:.1f}-{hi:.1f}] {bar:<30} {count}{marker}")
     print()
 
 
@@ -479,10 +409,8 @@ def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndar
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
-
         annotated_frame = frame.copy()
-        annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, keypoints, CONFIG.labels)
+        annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(annotated_frame, keypoints, CONFIG.labels)
         yield annotated_frame
 
 
@@ -492,7 +420,6 @@ def run_player_detection(source_video_path: str, device: str) -> Iterator[np.nda
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
-
         annotated_frame = frame.copy()
         annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
         annotated_frame = BOX_LABEL_ANNOTATOR.annotate(annotated_frame, detections)
@@ -505,15 +432,11 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
-    # FIX: was referencing undefined `ball_callback`, now correctly uses `callback`
     def callback(image_slice: np.ndarray) -> sv.Detections:
         result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
-    slicer = sv.InferenceSlicer(
-        callback=callback,
-        slice_wh=(640, 640),
-    )
+    slicer = sv.InferenceSlicer(callback=callback, slice_wh=(640, 640))
 
     for frame in frame_generator:
         detections = slicer(frame).with_nms(threshold=0.1)
@@ -531,30 +454,45 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
-
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
-
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, detections)
-        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels=labels)
+        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, detections, labels=labels)
         yield annotated_frame
 
 
 def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
-    Detect aerial duels by combining:
-    - airborne ball detection from BallTracker trajectory history
-    - nearby player tracking with ByteTrack
+    Aerial duel detection with:
+    - Team colors (full team classification pipeline)
+    - Ball detection and tracking
+    - Tight proximity threshold so only players genuinely contesting the ball trigger a duel
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
 
+    # --- Phase 1: collect crops for team classifier ---
+    stride = compute_stride(source_video_path, min_samples=8)
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=stride)
+    crops = []
+    for frame in tqdm(frame_generator, desc='collecting crops'):
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        high_conf_players = detections[
+            (detections.class_id == PLAYER_CLASS_ID) & (detections.confidence >= 0.8)
+        ]
+        crops += get_crops(frame, high_conf_players)
+
+    team_classifier = TeamClassifier(device=device)
+    team_classifier.fit(get_jersey_crops(crops))
+
+    # --- Phase 2: main processing loop ---
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    voter = TeamVoter()
+    class_voter = ClassVoter()
+    outlier_voter = OutlierVoter()
 
-    # FIX: relaxed BallTracker thresholds so falling ball still counts as airborne
     ball_tracker = BallTracker(
         buffer_size=20,
         min_airborne_frames=3,
@@ -563,8 +501,9 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         consistency_ratio=0.5,
     )
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+
     aerial_duel_detector = AerialDuelDetector(
-        proximity_threshold=150.0,
+        proximity_threshold=80.0,   # tight — only players right at the ball
         min_players=2,
         latch_frames=8,
     )
@@ -573,27 +512,45 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
-    slicer = sv.InferenceSlicer(
-        callback=ball_callback,
-        slice_wh=(640, 640),
-    )
+    slicer = sv.InferenceSlicer(callback=ball_callback, slice_wh=(640, 640))
 
     for frame in frame_generator:
-        # --- players ---
+        # --- detect + track all players ---
         player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        player_detections = sv.Detections.from_ultralytics(player_result)
-        player_detections = tracker.update_with_detections(player_detections)
+        detections = sv.Detections.from_ultralytics(player_result)
+        detections = tracker.update_with_detections(detections)
+        detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
 
-        players = player_detections[
-            (player_detections.class_id == PLAYER_CLASS_ID) |
-            (player_detections.class_id == GOALKEEPER_CLASS_ID)
+        # --- team classification ---
+        players = detections[detections.class_id == PLAYER_CLASS_ID]
+        crops = get_crops(frame, players)
+        jersey_crops = get_jersey_crops(crops)
+        players_team_id = team_classifier.predict(jersey_crops)
+        raw_outlier_mask = team_classifier.get_outlier_mask(jersey_crops)
+        smoothed_outlier_mask = outlier_voter.update(players.tracker_id, raw_outlier_mask)
+        players_team_id = voter.update(players.tracker_id, players_team_id)
+
+        goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
+        goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
+        referees = detections[detections.class_id == REFEREE_CLASS_ID]
+
+        all_detections = sv.Detections.merge([players, goalkeepers, referees])
+        player_colors = [
+            int(REFEREE_CLASS_ID) if smoothed_outlier_mask[i] else int(players_team_id[i])
+            for i in range(len(players_team_id))
         ]
+        color_lookup = np.array(
+            player_colors +
+            goalkeepers_team_id.tolist() +
+            [REFEREE_CLASS_ID] * len(referees)
+        )
 
         # --- ball ---
         ball_detections = slicer(frame).with_nms(threshold=0.1)
         ball_detections = ball_tracker.update(ball_detections)
 
-        # --- detect duel ---
+        # --- aerial duel detection ---
+        # Requires: ball airborne + 2 players within 80px of ball center
         is_duel, involved_players, ball_center = aerial_duel_detector.detect(
             ball_tracker=ball_tracker,
             players=players,
@@ -602,15 +559,18 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         # --- annotate ---
         annotated_frame = frame.copy()
 
-        if len(players) > 0:
-            labels = [str(tracker_id) for tracker_id in players.tracker_id]
-            annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, players)
-            annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-                annotated_frame, players, labels=labels)
+        # Draw all players with team colors
+        annotated_frame = ELLIPSE_ANNOTATOR.annotate(
+            annotated_frame, all_detections, custom_color_lookup=color_lookup)
+        labels = [str(tid) for tid in all_detections.tracker_id]
+        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
+            annotated_frame, all_detections, labels, custom_color_lookup=color_lookup)
 
+        # Draw ball
         if len(ball_detections) > 0:
             annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
 
+        # Airborne status indicator
         airborne_text = "BALL IN AIR" if ball_tracker.is_airborne() else "BALL ON GROUND"
         cv2.putText(
             annotated_frame, airborne_text, (20, 80),
@@ -619,9 +579,9 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
             2, cv2.LINE_AA,
         )
 
+        # Duel annotation
         if is_duel:
-            annotated_frame = annotate_aerial_duel(
-                annotated_frame, involved_players, ball_center)
+            annotated_frame = annotate_aerial_duel(annotated_frame, involved_players, ball_center)
 
         yield annotated_frame
 
@@ -629,8 +589,7 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
 def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=8)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -652,7 +611,6 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
-
         detections = tracker.update_with_detections(detections)
         detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
 
@@ -665,9 +623,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         players_team_id = voter.update(players.tracker_id, players_team_id)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
-        goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
-
+        goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
@@ -676,9 +632,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
             for i in range(len(players_team_id))
         ]
         color_lookup = np.array(
-            player_colors +
-            goalkeepers_team_id.tolist() +
-            [REFEREE_CLASS_ID] * len(referees)
+            player_colors + goalkeepers_team_id.tolist() + [REFEREE_CLASS_ID] * len(referees)
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
@@ -694,8 +648,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=8)
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=stride)
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -719,7 +672,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         keypoints = sv.KeyPoints.from_ultralytics(result)
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
-
         detections = tracker.update_with_detections(detections)
         detections.class_id = class_voter.update(detections.tracker_id, detections.class_id)
 
@@ -732,9 +684,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         players_team_id = voter.update(players.tracker_id, players_team_id)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
-        goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
-
+        goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
         detections = sv.Detections.merge([players, goalkeepers, referees])
@@ -743,9 +693,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
             for i in range(len(players_team_id))
         ]
         color_lookup = np.array(
-            player_colors +
-            goalkeepers_team_id.tolist() +
-            [REFEREE_CLASS_ID] * len(referees)
+            player_colors + goalkeepers_team_id.tolist() + [REFEREE_CLASS_ID] * len(referees)
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
@@ -759,12 +707,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         radar = render_radar(detections, keypoints, color_lookup)
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
-        rect = sv.Rect(
-            x=w // 2 - radar_w // 2,
-            y=h - radar_h,
-            width=radar_w,
-            height=radar_h
-        )
+        rect = sv.Rect(x=w // 2 - radar_w // 2, y=h - radar_h, width=radar_w, height=radar_h)
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
         yield annotated_frame
 
@@ -778,32 +721,24 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         return
 
     if mode == Mode.PITCH_DETECTION:
-        frame_generator = run_pitch_detection(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_pitch_detection(source_video_path=source_video_path, device=device)
     elif mode == Mode.PLAYER_DETECTION:
-        frame_generator = run_player_detection(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_player_detection(source_video_path=source_video_path, device=device)
     elif mode == Mode.BALL_DETECTION:
-        frame_generator = run_ball_detection(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_ball_detection(source_video_path=source_video_path, device=device)
     elif mode == Mode.PLAYER_TRACKING:
-        frame_generator = run_player_tracking(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_player_tracking(source_video_path=source_video_path, device=device)
     elif mode == Mode.AERIAL_DUEL:
-        frame_generator = run_aerial_duel(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_aerial_duel(source_video_path=source_video_path, device=device)
     elif mode == Mode.TEAM_CLASSIFICATION:
-        frame_generator = run_team_classification(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_team_classification(source_video_path=source_video_path, device=device)
     elif mode == Mode.RADAR:
-        frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
+        frame_generator = run_radar(source_video_path=source_video_path, device=device)
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
 
-    # Get screen resolution and calculate appropriate scale
     root = tk.Tk()
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
@@ -819,7 +754,8 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             h, w = frame.shape[:2]
             scale = min(max_display_width / w, max_display_height / h)
             if scale < 1:
-                display_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                display_frame = cv2.resize(frame, None, fx=scale, fy=scale,
+                                           interpolation=cv2.INTER_AREA)
             else:
                 display_frame = frame
 
