@@ -77,6 +77,7 @@ class TeamVoter:
                 self.locked[tid] = best
         return smoothed
 
+
 class OutlierVoter:
     """Per-tracker smoother for outlier (referee-like) detection.
 
@@ -195,16 +196,6 @@ class Mode(Enum):
 
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
-    """
-    Extract crops from the frame based on detected bounding boxes.
-
-    Args:
-        frame (np.ndarray): The frame from which to extract crops.
-        detections (sv.Detections): Detected objects with bounding boxes.
-
-    Returns:
-        List[np.ndarray]: List of cropped images.
-    """
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
 
@@ -233,24 +224,21 @@ def resolve_goalkeepers_team_id(
 ) -> np.ndarray:
     """
     Resolve the team IDs for detected goalkeepers based on the proximity to team
-    centroids.
-
-    Args:
-        players (sv.Detections): Detections of all players.
-        players_team_id (np.array): Array containing team IDs of detected players.
-        goalkeepers (sv.Detections): Detections of goalkeepers.
-
-    Returns:
-        np.ndarray: Array containing team IDs for the detected goalkeepers.
-
-    This function calculates the centroids of the two teams based on the positions of
-    the players. Then, it assigns each goalkeeper to the nearest team's centroid by
-    calculating the distance between each goalkeeper and the centroids of the two teams.
+    centroids. Guards against empty team arrays to avoid RuntimeWarning.
     """
     goalkeepers_xy = goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
     players_xy = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    team_0_centroid = players_xy[players_team_id == 0].mean(axis=0)
-    team_1_centroid = players_xy[players_team_id == 1].mean(axis=0)
+
+    team_0_players = players_xy[players_team_id == 0]
+    team_1_players = players_xy[players_team_id == 1]
+
+    # FIX: if either team has no players detected, fall back to team 0
+    if len(team_0_players) == 0 or len(team_1_players) == 0:
+        return np.zeros(len(goalkeepers_xy), dtype=int)
+
+    team_0_centroid = team_0_players.mean(axis=0)
+    team_1_centroid = team_1_players.mean(axis=0)
+
     goalkeepers_team_id = []
     for goalkeeper_xy in goalkeepers_xy:
         dist_0 = np.linalg.norm(goalkeeper_xy - team_0_centroid)
@@ -264,28 +252,21 @@ def render_radar(
     keypoints: sv.KeyPoints,
     color_lookup: np.ndarray
 ) -> np.ndarray:
-    
     """
     Create a radar view by transforming player positions onto a 2D pitch representation.
     Only uses keypoints that are actually detected (confidence > 0.5 and within frame).
     """
-    # Filter keypoints based on confidence and validity
-    # Keypoints at (0,0) or very low confidence are not detected
     all_keypoints = keypoints.xy[0]
     all_confidence = keypoints.confidence[0] if keypoints.confidence is not None else np.ones(len(all_keypoints))
-    
-    # Create mask for valid keypoints (detected with confidence > 0.5 and not at origin)
+
     mask = (all_keypoints[:, 0] > 1) & (all_keypoints[:, 1] > 1) & (all_confidence > 0.5)
-    
-    # Need at least 4 points for homography
+
     if np.sum(mask) < 4:
-        # If we don't have enough valid keypoints, return an empty pitch
         return draw_pitch(config=CONFIG)
-    
-    # Filter source keypoints and corresponding target vertices
+
     source_keypoints = all_keypoints[mask].astype(np.float32)
     target_vertices = np.array(CONFIG.vertices)[mask].astype(np.float32)
-    
+
     try:
         transformer = ViewTransformer(
             source=source_keypoints,
@@ -294,13 +275,10 @@ def render_radar(
         xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
         transformed_xy = transformer.transform_points(points=xy)
 
-        # Clip transformed coordinates to stay within pitch bounds
-        # This prevents players from appearing outside the visible portion
         transformed_xy[:, 0] = np.clip(transformed_xy[:, 0], 0, CONFIG.length)
         transformed_xy[:, 1] = np.clip(transformed_xy[:, 1], 0, CONFIG.width)
 
     except (ValueError, cv2.error):
-        # If homography fails, return empty pitch
         return draw_pitch(config=CONFIG)
 
     radar = draw_pitch(config=CONFIG)
@@ -318,16 +296,26 @@ def render_radar(
         face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
     return radar
 
+
 class AerialDuelDetector:
     """
     Detects an aerial duel when:
     - the ball is airborne, and
     - at least `min_players` players are close to the ball.
+
+    Includes a latch so a single frame drop doesn't kill the duel annotation.
     """
 
-    def __init__(self, proximity_threshold: float = 150.0, min_players: int = 2):
+    def __init__(
+        self,
+        proximity_threshold: float = 150.0,
+        min_players: int = 2,
+        latch_frames: int = 8,
+    ):
         self.proximity_threshold = proximity_threshold
         self.min_players = min_players
+        self.latch_frames = latch_frames
+        self._latch_count = 0
 
     @staticmethod
     def get_player_duel_points(detections: sv.Detections) -> np.ndarray:
@@ -346,13 +334,13 @@ class AerialDuelDetector:
         players: sv.Detections,
     ) -> tuple[bool, sv.Detections, np.ndarray | None]:
         ball_center = ball_tracker.get_ball_center()
+
         if ball_center is None:
-            return False, players[[]], None
+            self._latch_count = max(0, self._latch_count - 1)
+            return self._latch_count > 0, players[[]], None
 
         if len(players) == 0:
-            return False, players[[]], ball_center
-
-        if not ball_tracker.is_airborne():
+            self._latch_count = 0
             return False, players[[]], ball_center
 
         player_points = self.get_player_duel_points(players)
@@ -360,8 +348,15 @@ class AerialDuelDetector:
         mask = distances <= self.proximity_threshold
         involved = players[mask]
 
-        return len(involved) >= self.min_players, involved, ball_center
-    
+        # FIX: relaxed thresholds — treat falling ball as still airborne
+        currently_dueling = ball_tracker.is_airborne() and len(involved) >= self.min_players
+        if currently_dueling:
+            self._latch_count = self.latch_frames
+        else:
+            self._latch_count = max(0, self._latch_count - 1)
+
+        return self._latch_count > 0, involved, ball_center
+
 
 def annotate_aerial_duel(
     frame: np.ndarray,
@@ -373,10 +368,8 @@ def annotate_aerial_duel(
 
     bx, by = map(int, ball_center)
 
-    # Ball marker
     cv2.circle(frame, (bx, by), 8, (0, 255, 255), 2)
 
-    # Draw player boxes + IDs + line to ball
     for i, xyxy in enumerate(players_involved.xyxy.astype(int)):
         x1, y1, x2, y2 = xyxy
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -387,14 +380,8 @@ def annotate_aerial_duel(
 
         label = f"AERIAL DUEL #{track_id}" if track_id is not None else "AERIAL DUEL"
         cv2.putText(
-            frame,
-            label,
-            (x1, max(y1 - 10, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
+            frame, label, (x1, max(y1 - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA,
         )
 
         px = int((x1 + x2) / 2)
@@ -402,23 +389,13 @@ def annotate_aerial_duel(
         cv2.line(frame, (px, py), (bx, by), (0, 255, 255), 2)
 
     cv2.putText(
-        frame,
-        "AERIAL DUEL",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 0, 255),
-        3,
-        cv2.LINE_AA,
+        frame, "AERIAL DUEL", (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA,
     )
     return frame
 
 
 def run_referee_diagnostic(source_video_path: str, device: str) -> None:
-    """
-    Sample frames and print confidence score statistics for all REFEREE_CLASS_ID
-    detections. Use this to find a good confidence threshold for reclassification.
-    """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=30)
     frame_generator = sv.get_video_frames_generator(
@@ -444,7 +421,6 @@ def run_referee_diagnostic(source_video_path: str, device: str) -> None:
     print(f"  max:  {scores.max():.3f}")
     print(f"  mean: {scores.mean():.3f}")
 
-    # ASCII histogram with 10 bins from 0.0 to 1.0
     print("\n  Histogram (0.0 → 1.0):")
     bin_edges = np.linspace(0.0, 1.0, 11)
     counts, _ = np.histogram(scores, bins=bin_edges)
@@ -459,10 +435,6 @@ def run_referee_diagnostic(source_video_path: str, device: str) -> None:
 
 
 def run_player_diagnostic(source_video_path: str, device: str) -> None:
-    """
-    Sample frames and print confidence score statistics for all PLAYER_CLASS_ID
-    detections. Use this to find a good confidence threshold for crop collection.
-    """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=30)
     frame_generator = sv.get_video_frames_generator(
@@ -502,16 +474,6 @@ def run_player_diagnostic(source_video_path: str, device: str) -> None:
 
 
 def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Run pitch detection on a video and yield annotated frames.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
-    """
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     for frame in frame_generator:
@@ -525,16 +487,6 @@ def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndar
 
 
 def run_player_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Run player detection on a video and yield annotated frames.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
-    """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     for frame in frame_generator:
@@ -548,27 +500,18 @@ def run_player_detection(source_video_path: str, device: str) -> Iterator[np.nda
 
 
 def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Run ball detection on a video and yield annotated frames.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
-    """
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
+    # FIX: was referencing undefined `ball_callback`, now correctly uses `callback`
     def callback(image_slice: np.ndarray) -> sv.Detections:
         result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
     slicer = sv.InferenceSlicer(
-        callback=ball_callback,
+        callback=callback,
         slice_wh=(640, 640),
     )
 
@@ -581,16 +524,6 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
 
 def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Run player tracking on a video and yield annotated frames with tracked players.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
-    """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
@@ -607,6 +540,7 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
             annotated_frame, detections, labels=labels)
         yield annotated_frame
 
+
 def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
     Detect aerial duels by combining:
@@ -619,17 +553,20 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
 
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+
+    # FIX: relaxed BallTracker thresholds so falling ball still counts as airborne
     ball_tracker = BallTracker(
-        buffer_size=12,
-        min_airborne_frames=5,
-        vertical_threshold=4.0,
-        vertical_ratio_threshold=0.8,
-        consistency_ratio=0.6,
+        buffer_size=20,
+        min_airborne_frames=3,
+        vertical_threshold=2.0,
+        vertical_ratio_threshold=0.55,
+        consistency_ratio=0.5,
     )
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
     aerial_duel_detector = AerialDuelDetector(
         proximity_threshold=150.0,
         min_players=2,
+        latch_frames=8,
     )
 
     def ball_callback(image_slice: np.ndarray) -> sv.Detections:
@@ -647,7 +584,6 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         player_detections = sv.Detections.from_ultralytics(player_result)
         player_detections = tracker.update_with_detections(player_detections)
 
-        # Keep only outfield players + goalkeepers for duel logic
         players = player_detections[
             (player_detections.class_id == PLAYER_CLASS_ID) |
             (player_detections.class_id == GOALKEEPER_CLASS_ID)
@@ -670,46 +606,27 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
             labels = [str(tracker_id) for tracker_id in players.tracker_id]
             annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, players)
             annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-                annotated_frame,
-                players,
-                labels=labels,
-            )
+                annotated_frame, players, labels=labels)
 
         if len(ball_detections) > 0:
             annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
 
         airborne_text = "BALL IN AIR" if ball_tracker.is_airborne() else "BALL ON GROUND"
         cv2.putText(
-            annotated_frame,
-            airborne_text,
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            annotated_frame, airborne_text, (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
             (0, 255, 255) if ball_tracker.is_airborne() else (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+            2, cv2.LINE_AA,
         )
 
         if is_duel:
             annotated_frame = annotate_aerial_duel(
-                annotated_frame,
-                involved_players,
-                ball_center,
-            )
+                annotated_frame, involved_players, ball_center)
 
         yield annotated_frame
 
+
 def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Run team classification on a video and yield annotated frames with team colors.
-
-    Args:
-        source_video_path (str): Path to the source video.
-        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
-
-    Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames.
-    """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     stride = compute_stride(source_video_path, min_samples=8)
     frame_generator = sv.get_video_frames_generator(
@@ -836,8 +753,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
             annotated_frame, detections, custom_color_lookup=color_lookup)
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels,
-            custom_color_lookup=color_lookup)
+            annotated_frame, detections, labels, custom_color_lookup=color_lookup)
 
         h, w, _ = frame.shape
         radar = render_radar(detections, keypoints, color_lookup)
@@ -893,7 +809,6 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
     screen_height = root.winfo_screenheight()
     root.destroy()
 
-    # Use 90% of screen height to leave room for taskbar
     max_display_height = int(screen_height * 0.9)
     max_display_width = int(screen_width * 0.9)
 
@@ -901,7 +816,6 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         for frame in frame_generator:
             sink.write_frame(frame)
 
-            # Resize frame to fit screen
             h, w = frame.shape[:2]
             scale = min(max_display_width / w, max_display_height / h)
             if scale < 1:
