@@ -1,0 +1,11 @@
+soccer-env/
+venv/
+__pycache__/
+*.mp4
+*.pt
+*.avi
+*.mov
+outputs/
+data/
+node_modules/
+*.pyc
