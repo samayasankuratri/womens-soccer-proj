@@ -22,7 +22,7 @@ from sports.configs.soccer import SoccerPitchConfiguration
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-player-detection.pt')
 PITCH_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-pitch-detection.pt')
-BALL_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-ball-detection.pt')
+BALL_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/best.pt')
 
 BALL_CLASS_ID = 0
 GOALKEEPER_CLASS_ID = 1
