@@ -239,11 +239,14 @@ class AerialDuelDetector:
     """
     Detects an aerial duel when ALL of:
     - the ball is currently airborne
-    - at least `min_players` players are within `proximity_threshold` pixels of the ball
-    - proximity is measured to the player's upper body (head/chest) not feet
+    - at least `min_players` players are within `pitch_proximity_meters` of the ball
+      (measured in real-world pitch coordinates via homography)
+    - at least one player from each team is involved (no same-team false positives)
 
-    `proximity_threshold` is intentionally tight (80px default) so only players
-    genuinely contesting the ball trigger a duel — not nearby bystanders.
+    When a ViewTransformer is available (pitch keypoints detected), distances are
+    computed in pitch-space meters — physically meaningful regardless of camera zoom
+    or angle. Falls back to body-height-relative pixel distances when homography
+    is unavailable (too few keypoints visible).
 
     A latch keeps the annotation alive for `latch_frames` frames after the
     conditions drop out, to handle brief ball detection gaps.
@@ -251,18 +254,20 @@ class AerialDuelDetector:
 
     def __init__(
         self,
-        proximity_threshold: float = 80.0,   # tight — only players right at the ball
+        pitch_proximity_meters: float = 3.0,    # real-world distance threshold in pitch units (~meters)
+        proximity_body_fraction: float = 0.6,   # fallback: fraction of player height when no homography
         min_players: int = 2,
-        latch_frames: int = 8,
+        latch_frames: int = 4,
     ):
-        self.proximity_threshold = proximity_threshold
+        self.pitch_proximity_meters = pitch_proximity_meters
+        self.proximity_body_fraction = proximity_body_fraction
         self.min_players = min_players
         self.latch_frames = latch_frames
         self._latch_count = 0
 
     @staticmethod
     def get_player_duel_points(detections: sv.Detections) -> np.ndarray:
-        """Upper-body point (head/chest) — better match for aerial headers."""
+        """Upper-body point (head/chest) in pixel space — better match for aerial headers."""
         xyxy = detections.xyxy
         x = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
         y = xyxy[:, 1] + 0.25 * (xyxy[:, 3] - xyxy[:, 1])
@@ -272,6 +277,8 @@ class AerialDuelDetector:
         self,
         ball_tracker: BallTracker,
         players: sv.Detections,
+        players_team_id: np.ndarray | None = None,
+        transformer: ViewTransformer | None = None,
     ) -> tuple[bool, sv.Detections, np.ndarray | None]:
         ball_center = ball_tracker.get_ball_center()
 
@@ -288,13 +295,39 @@ class AerialDuelDetector:
             self._latch_count = max(0, self._latch_count - 1)
             return self._latch_count > 0, players[[]], ball_center
 
-        # Check which players are within the tight proximity threshold
-        player_points = self.get_player_duel_points(players)
-        distances = np.linalg.norm(player_points - ball_center, axis=1)
-        mask = distances <= self.proximity_threshold
+        # --- Compute proximity mask ---
+        # Prefer pitch-space (meters) when homography is available; fall back to pixels
+        player_points_px = self.get_player_duel_points(players)
+
+        if transformer is not None:
+            try:
+                # Project player upper-body points and ball center into pitch coordinates
+                player_points_pitch = transformer.transform_points(player_points_px)
+                ball_center_pitch = transformer.transform_points(ball_center[np.newaxis])[0]
+                distances = np.linalg.norm(player_points_pitch - ball_center_pitch, axis=1)
+                mask = distances <= self.pitch_proximity_meters
+            except (ValueError, cv2.error):
+                # Homography degenerate this frame — fall back to pixel distances
+                transformer = None
+
+        if transformer is None:
+            # Fallback: scale threshold by each player's bounding box height
+            player_heights = players.xyxy[:, 3] - players.xyxy[:, 1]
+            thresholds = player_heights * self.proximity_body_fraction
+            distances = np.linalg.norm(player_points_px - ball_center, axis=1)
+            mask = distances <= thresholds
+
         involved = players[mask]
 
-        currently_dueling = len(involved) >= self.min_players
+        # Require players from both teams — eliminates same-team false positives
+        has_both_teams = False
+        if players_team_id is not None and len(players_team_id) == len(players):
+            involved_team_ids = players_team_id[mask]
+            has_both_teams = len(np.unique(involved_team_ids)) >= 2
+        else:
+            has_both_teams = len(involved) >= self.min_players
+
+        currently_dueling = len(involved) >= self.min_players and has_both_teams
         if currently_dueling:
             self._latch_count = self.latch_frames
         else:
@@ -461,15 +494,43 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
+def _build_transformer(keypoints: sv.KeyPoints) -> ViewTransformer | None:
+    """
+    Build a ViewTransformer from pitch keypoints for homography-based projection.
+    Returns None if too few confident keypoints are visible this frame.
+    """
+    all_keypoints = keypoints.xy[0]
+    all_confidence = (
+        keypoints.confidence[0]
+        if keypoints.confidence is not None
+        else np.ones(len(all_keypoints))
+    )
+    mask = (all_keypoints[:, 0] > 1) & (all_keypoints[:, 1] > 1) & (all_confidence > 0.5)
+    if np.sum(mask) < 4:
+        return None
+    try:
+        return ViewTransformer(
+            source=all_keypoints[mask].astype(np.float32),
+            target=np.array(CONFIG.vertices)[mask].astype(np.float32),
+        )
+    except (ValueError, cv2.error):
+        return None
+
+
 def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     """
     Aerial duel detection with:
     - Team colors (full team classification pipeline)
-    - Ball detection and tracking
-    - Tight proximity threshold so only players genuinely contesting the ball trigger a duel
+    - Ball detection and tracking with tighter airborne thresholds
+    - Pitch homography (ViewTransformer) for real-world meter-based proximity:
+        distances between players and ball are computed in pitch coordinates (~meters)
+        so the threshold is physically meaningful regardless of camera zoom/angle
+    - Falls back to body-height-relative pixel distances when homography unavailable
+    - Cross-team check: both teams must be involved for a duel to trigger
     """
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
 
     # --- Phase 1: collect crops for team classifier ---
     stride = compute_stride(source_video_path, min_samples=8)
@@ -493,19 +554,21 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
     class_voter = ClassVoter()
     outlier_voter = OutlierVoter()
 
+    # Tighter airborne thresholds to reduce false positives on rolling/bouncing balls
     ball_tracker = BallTracker(
         buffer_size=20,
-        min_airborne_frames=3,
-        vertical_threshold=2.0,
-        vertical_ratio_threshold=0.55,
-        consistency_ratio=0.5,
+        min_airborne_frames=5,           # was 3 — needs more consecutive frames to confirm airborne
+        vertical_threshold=4.0,          # was 2.0 — needs stronger upward motion
+        vertical_ratio_threshold=0.70,   # was 0.55 — majority of buffer must be rising
+        consistency_ratio=0.65,          # was 0.5 — stricter consistency requirement
     )
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
     aerial_duel_detector = AerialDuelDetector(
-        proximity_threshold=80.0,   # tight — only players right at the ball
+        pitch_proximity_meters=3.0,   # ~3 metres in pitch space — tight, physically meaningful
+        proximity_body_fraction=0.6,  # fallback if homography unavailable
         min_players=2,
-        latch_frames=8,
+        latch_frames=4,
     )
 
     def ball_callback(image_slice: np.ndarray) -> sv.Detections:
@@ -515,6 +578,11 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
     slicer = sv.InferenceSlicer(callback=ball_callback, slice_wh=(640, 640))
 
     for frame in frame_generator:
+        # --- pitch keypoints → homography transformer ---
+        pitch_result = pitch_detection_model(frame, verbose=False)[0]
+        keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
+        transformer = _build_transformer(keypoints)  # None if too few keypoints visible
+
         # --- detect + track all players ---
         player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(player_result)
@@ -550,10 +618,14 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         ball_detections = ball_tracker.update(ball_detections)
 
         # --- aerial duel detection ---
-        # Requires: ball airborne + 2 players within 80px of ball center
+        # Primary: pitch-space meter distances via homography (transformer)
+        # Fallback: body-height-relative pixel distances if homography unavailable
+        # Also requires: ball airborne + players from both teams within range
         is_duel, involved_players, ball_center = aerial_duel_detector.detect(
             ball_tracker=ball_tracker,
             players=players,
+            players_team_id=players_team_id,
+            transformer=transformer,
         )
 
         # --- annotate ---
