@@ -15,26 +15,31 @@ def analyze():
 
         video = request.files['video']
 
-        os.makedirs('data/input', exist_ok=True)
-        os.makedirs('outputs', exist_ok=True)
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+        os.makedirs(os.path.join(base_dir, 'data', 'input'), exist_ok=True)
+        os.makedirs(os.path.join(base_dir, 'outputs'), exist_ok=True)
 
-        input_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'input', 'uploaded_video.mp4')
-        output_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'outputs', 'output.mp4')
+        input_path = os.path.join(base_dir, 'data', 'input', 'uploaded_video.mp4')
+        output_path = os.path.join(base_dir, 'outputs', 'output.mp4')
 
         video.save(input_path)
 
         result = subprocess.run([
-            'python', 'analyze.py',
+            'python', 'main.py',
             '--source_video_path', input_path,
             '--target_video_path', output_path,
-            '--device', 'cpu'
-        ], capture_output=True, text=True)
+            '--device', 'cuda',
+            '--mode', 'AERIAL_DUEL'
+        ], capture_output=True, text=True, cwd=base_dir)
 
         print("STDOUT:", result.stdout)
         print("STDERR:", result.stderr)
 
         if result.returncode != 0:
             return jsonify({'error': result.stderr}), 500
+
+        if not os.path.exists(output_path):
+            return jsonify({'error': 'Output file not found'}), 500
 
         return send_file(output_path, mimetype='video/mp4')
 
