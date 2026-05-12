@@ -10,3 +10,6 @@ tqdm
 scipy
 pillow
 umap-learn
+transformers
+sentencepiece
+protobuf
