@@ -1,11 +1,24 @@
 import { useState, useRef } from "react";
 
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
+
+const MODES = [
+  { value: "AERIAL_DUEL",        label: "Aerial Duel Detection" },
+  { value: "RADAR",              label: "Radar / Mini-map" },
+  { value: "TEAM_CLASSIFICATION",label: "Team Classification" },
+  { value: "PLAYER_TRACKING",    label: "Player Tracking" },
+  { value: "BALL_DETECTION",     label: "Ball Detection" },
+  { value: "PLAYER_DETECTION",   label: "Player Detection" },
+  { value: "PITCH_DETECTION",    label: "Pitch Detection" },
+];
+
 function App() {
   const [video, setVideo] = useState(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState(null);
   const [outputUrl, setOutputUrl] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [mode, setMode] = useState("AERIAL_DUEL");
   const [dragOver, setDragOver] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
@@ -53,8 +66,9 @@ function App() {
 
     const formData = new FormData();
     formData.append("video", video);
+    formData.append("mode", mode);
     try {
-      const response = await fetch("https://canyon-pretext-robbing.ngrok-free.dev/analyze", {
+      const response = await fetch(`${API_URL}/analyze`, {
         method: "POST",
         headers: { "ngrok-skip-browser-warning": "true" },
         body: formData,
@@ -86,6 +100,7 @@ function App() {
     setError(null);
     setProgress(0);
     setProgressLabel("");
+    setMode("AERIAL_DUEL");
   };
 
   return (
@@ -159,6 +174,23 @@ function App() {
             <div style={{ borderRadius: "12px", overflow: "hidden", border: "1px solid #ffffff15" }}>
               <video src={videoPreviewUrl} controls style={{ width: "100%", display: "block", backgroundColor: "#000", maxHeight: "300px" }} />
             </div>
+          </div>
+        )}
+
+        {/* Mode Selector */}
+        {!outputUrl && (
+          <div style={{ marginBottom: "16px" }}>
+            <p style={{ color: "#ffffff60", fontSize: "13px", marginBottom: "8px", letterSpacing: "0.5px" }}>ANALYSIS MODE</p>
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value)}
+              disabled={loading}
+              style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "1px solid #ffffff20", backgroundColor: "#ffffff08", color: "white", fontSize: "14px", cursor: "pointer", outline: "none" }}
+            >
+              {MODES.map(({ value, label }) => (
+                <option key={value} value={value} style={{ backgroundColor: "#0d1b2a" }}>{label}</option>
+              ))}
+            </select>
           </div>
         )}
 
