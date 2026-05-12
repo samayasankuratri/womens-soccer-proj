@@ -110,3 +110,22 @@ class TeamClassifier:
         data = self.extract_features(crops)
         projections = self.reducer.transform(data)
         return self.cluster_model.predict(projections)
+
+    def get_outlier_mask(self, crops: List[np.ndarray]) -> np.ndarray:
+        """
+        Return a boolean mask where True means the crop doesn't clearly
+        belong to either team cluster (e.g. a referee).
+
+        Uses distance to nearest cluster center — points further than
+        mean + 1 std are considered outliers.
+        """
+        if len(crops) == 0:
+            return np.array([], dtype=bool)
+
+        data = self.extract_features(crops)
+        projections = self.reducer.transform(data)
+        # distances shape: (n_samples, n_clusters)
+        distances = self.cluster_model.transform(projections)
+        min_distances = distances.min(axis=1)
+        threshold = min_distances.mean() + min_distances.std()
+        return min_distances > threshold
