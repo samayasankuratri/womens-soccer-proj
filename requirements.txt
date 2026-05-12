@@ -1,0 +1,12 @@
+flask
+flask-cors
+numpy
+pandas
+opencv-python
+matplotlib
+supervision
+ultralytics
+tqdm
+scipy
+pillow
+umap-learn
