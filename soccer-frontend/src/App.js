@@ -73,7 +73,11 @@ function App() {
         headers: { "ngrok-skip-browser-warning": "true" },
         body: formData,
       });
-      if (!response.ok) throw new Error("Analysis failed");
+      if (!response.ok) {
+        let errMsg = `Server error ${response.status}`;
+        try { const d = await response.json(); errMsg = d.error || errMsg; } catch {}
+        throw new Error(errMsg);
+      }
       const blob = await response.blob();
       clearInterval(progressInterval.current);
       setProgress(100);
@@ -81,7 +85,7 @@ function App() {
       setOutputUrl(URL.createObjectURL(blob));
     } catch (err) {
       clearInterval(progressInterval.current);
-      setError("Something went wrong. Make sure your backend is running.");
+      setError(err.message || "Something went wrong. Make sure your backend is running.");
     } finally {
       setLoading(false);
     }
