@@ -69,35 +69,54 @@ class BallTracker:
     """
     A class used to track a soccer ball's position across video frames.
 
-    The BallTracker class maintains a buffer of recent ball positions and uses this
-    buffer to predict the ball's position in the current frame by selecting the
-    detection closest to the average position (centroid) of the recent positions.
+    Uses velocity-based prediction: estimates where the ball will be next based on
+    recent movement, then picks the detection closest to that predicted position.
+    Only confirmed detections are added to the buffer, preventing empty frames from
+    polluting the position history.
 
     Attributes:
-        buffer (collections.deque): A deque buffer to store recent ball positions.
+        buffer (collections.deque): A deque buffer storing confirmed ball positions.
     """
     def __init__(self, buffer_size: int = 10):
         self.buffer = deque(maxlen=buffer_size)
 
     def update(self, detections: sv.Detections) -> sv.Detections:
         """
-        Updates the buffer with new detections and returns the detection closest to the
-        centroid of recent positions.
+        Updates the buffer with the best detection and returns it.
+
+        Predicts the next ball position using recent velocity, then selects the
+        detection closest to that prediction. Falls back to the last known position
+        if velocity cannot be computed. Only appends to the buffer when a detection
+        is confirmed, so empty frames never corrupt the position history.
 
         Args:
             detections (sv.Detections): The current frame's ball detections.
 
         Returns:
-            sv.Detections: The detection closest to the centroid of recent positions.
-            If there are no detections, returns the input detections.
+            sv.Detections: The best matching detection, or empty detections if none.
         """
-        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
-        self.buffer.append(xy)
-
         if len(detections) == 0:
             return detections
 
-        centroid = np.mean(np.concatenate(self.buffer), axis=0)
-        distances = np.linalg.norm(xy - centroid, axis=1)
-        index = np.argmin(distances)
+        xy = detections.get_anchors_coordinates(sv.Position.CENTER)
+
+        if len(self.buffer) == 0:
+            # No history — take highest-confidence detection
+            if detections.confidence is not None:
+                index = int(np.argmax(detections.confidence))
+            else:
+                index = 0
+            self.buffer.append(xy[index])
+            return detections[[index]]
+
+        # Predict next position using velocity from recent frames
+        if len(self.buffer) >= 2:
+            velocity = self.buffer[-1] - self.buffer[-2]
+            predicted = self.buffer[-1] + velocity
+        else:
+            predicted = self.buffer[-1]
+
+        distances = np.linalg.norm(xy - predicted, axis=1)
+        index = int(np.argmin(distances))
+        self.buffer.append(xy[index])
         return detections[[index]]

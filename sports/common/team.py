@@ -1,13 +1,12 @@
 from typing import Generator, Iterable, List, TypeVar
 
-import torch
 import numpy as np
 import supervision as sv
 import torch
 import umap
 from sklearn.cluster import KMeans
 from tqdm import tqdm
-from transformers import AutoProcessor, SiglipModel
+from transformers import AutoProcessor, SiglipVisionModel
 
 V = TypeVar("V")
 
@@ -54,8 +53,8 @@ class TeamClassifier:
        """
         self.device = device
         self.batch_size = batch_size
-        self.features_model = SiglipModel.from_pretrained(SIGLIP_MODEL_PATH).vision_model.to(device)
-        self.features_model.eval()
+        self.features_model = SiglipVisionModel.from_pretrained(
+            SIGLIP_MODEL_PATH).to(device)
         self.processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
         self.reducer = umap.UMAP(n_components=3)
         self.cluster_model = KMeans(n_clusters=2)
