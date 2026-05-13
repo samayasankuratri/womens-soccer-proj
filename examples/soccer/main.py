@@ -345,27 +345,45 @@ class AerialDuelDetector:
         min_players: int = 2,
         latch_frames: int = 4,
         airborne_min_frames: int = 5,
-        airborne_up_ratio: float = 0.55,
         recent_proximity_frames: int = 30,
         # Airborne detection tuning
         airborne_speed_normaliser: float = 12.0,
-        airborne_curve_threshold: float = 15.0,
+        airborne_parabolic_normaliser: float = 0.15,
+        airborne_min_y_ratio: float = 0.20,
         airborne_score_threshold: float = 0.45,
+        airborne_exit_threshold: float = 0.30,
+        airborne_score_window: int = 5,
+        # Foot baseline tuning (signal 4)
+        foot_nearby_px: float = 300.0,
+        # Homography pitch displacement tuning (signal 5)
+        homography_nearby_px: float = 250.0,
+        homography_ground_cm: float = 200.0,
+        homography_elevated_cm: float = 600.0,
     ):
         self.pitch_proximity_meters = pitch_proximity_meters
         self.proximity_body_fraction = proximity_body_fraction
         self.min_players = min_players
         self.latch_frames = latch_frames
         self.airborne_min_frames = airborne_min_frames
-        self.airborne_up_ratio = airborne_up_ratio
         self.recent_proximity_frames = recent_proximity_frames
         self.airborne_speed_normaliser = airborne_speed_normaliser
-        self.airborne_curve_threshold = airborne_curve_threshold
+        self.airborne_parabolic_normaliser = airborne_parabolic_normaliser
+        self.airborne_min_y_ratio = airborne_min_y_ratio
         self.airborne_score_threshold = airborne_score_threshold
+        self.airborne_exit_threshold = airborne_exit_threshold
+        self.airborne_score_window = airborne_score_window
+        self.foot_nearby_px = foot_nearby_px
+        self.homography_nearby_px = homography_nearby_px
+        self.homography_ground_cm = homography_ground_cm
+        self.homography_elevated_cm = homography_elevated_cm
         self._latch_count = 0
         self._near_ball_history: dict[int, deque] = defaultdict(
             lambda: deque(maxlen=recent_proximity_frames))
         self._frame_index: int = 0
+        self._last_players: sv.Detections | None = None
+        self._last_transformer: ViewTransformer | None = None
+        self._is_airborne_state: bool = False
+        self._score_history: deque = deque(maxlen=airborne_score_window)
 
     @staticmethod
     def get_ball_center(ball_tracker: BallTracker) -> np.ndarray | None:
@@ -378,23 +396,33 @@ class AerialDuelDetector:
 
     def is_airborne(self, ball_tracker: BallTracker) -> bool:
         """
-        Multi-signal airborne detection combining 4 signals:
+        Multi-signal airborne detection with smoothing and hysteresis.
 
-        1. Upward motion ratio — how often ball moves upward (y decreasing)
-        2. Speed — airborne balls move faster than rolling ones
-        3. Vertical acceleration — gravity gives airborne balls parabolic
-           y-trajectory (linear dy over time)
-        4. Trajectory curvature — airborne balls arc; ground balls roll straight
+        Signals:
+          1. Upward motion ratio — fraction of frames where ball moves upward
+          2. Speed — fast movement correlates loosely with airborne
+          3. Parabolic fit — y(t) fits at²+bt+c (airborne) significantly better
+             than a line (ground roll); measured as R² improvement
+          4. Foot baseline — ball center sits above nearby player feet
+             (normalised by player height)
+          5. Homography displacement — ball projects to wrong pitch position
+             when elevated (ground-plane homography gives incorrect result)
 
-        Tuning (via constructor params):
-          airborne_speed_normaliser  — raise if fast ground passes trigger false positives
-          airborne_curve_threshold   — raise if slow lofted balls are missed
-          airborne_score_threshold   — raise for fewer false positives,
-                                       lower for fewer missed detections
+        Output is smoothed over `airborne_score_window` frames and gated by
+        hysteresis: entry at `airborne_score_threshold`, exit at
+        `airborne_exit_threshold` (lower).
+
+        Tuning:
+          airborne_score_threshold    — raise for fewer false positives
+          airborne_exit_threshold     — raise to exit airborne state sooner
+          airborne_parabolic_normaliser — R² improvement that maps to score 1.0;
+                                          lower = more sensitive to weak arcs
+          airborne_score_window       — frames to average; higher = smoother but
+                                          slower to respond to state changes
         """
         buf = ball_tracker.buffer
         if len(buf) < self.airborne_min_frames:
-            return False
+            return self._is_airborne_state
 
         def get_xy(entry) -> tuple[float, float]:
             arr = np.asarray(entry).ravel()
@@ -407,65 +435,147 @@ class AerialDuelDetector:
         ys = np.array([p[1] for p in positions])
 
         # --- Signal 1: upward motion ratio ---
-        # y decreasing = ball moving up in image coordinates
         dy = np.diff(ys)
         dx = np.diff(xs)
         up_ratio = float(np.sum(dy < 0)) / max(len(dy), 1)
 
         # --- Signal 2: speed ---
-        # Airborne balls move faster than rolling balls.
-        # airborne_speed_normaliser px/frame maps to a score of 1.0.
         speeds = np.sqrt(dx ** 2 + dy ** 2)
         mean_speed = float(np.mean(speeds))
         speed_score = min(1.0, mean_speed / self.airborne_speed_normaliser)
 
-        # --- Signal 3: vertical acceleration (gravity signature) ---
-        # Airborne ball: y(t) = at² + bt + c → dy(t) is linear.
-        # Fit a line to dy and measure R². High R² = smooth parabolic = airborne.
-        if len(dy) >= 4:
-            t = np.arange(len(dy), dtype=float)
-            coeffs = np.polyfit(t, dy, 1)
-            dy_fit = np.polyval(coeffs, t)
-            ss_res = float(np.sum((dy - dy_fit) ** 2))
-            ss_tot = float(np.sum((dy - dy.mean()) ** 2))
-            accel_score = max(0.0, 1.0 - (ss_res / ss_tot)) if ss_tot > 1e-6 else 0.0
+        # --- Signal 3: parabolic model fit ---
+        # Fit y(t) with a line (ground model) and a parabola (airborne model).
+        # The R² improvement from adding the quadratic term measures how much
+        # better the under-gravity parabola explains the trajectory vs. a roll.
+        #
+        # Gate: scale the score by the fraction of total motion that is vertical.
+        # Long driven ground passes move almost entirely in x with tiny y-range,
+        # so even a perspective-induced curve produces negligible vertical fraction
+        # and the parabolic score is suppressed.  True airborne balls always have
+        # significant vertical displacement.
+        parabolic_score = 0.0
+        if len(ys) >= 5:
+            t = np.arange(len(ys), dtype=float)
+            lin_fit = np.polyfit(t, ys, 1)
+            par_fit = np.polyfit(t, ys, 2)
+            lin_res = float(np.sum((ys - np.polyval(lin_fit, t)) ** 2))
+            par_res = float(np.sum((ys - np.polyval(par_fit, t)) ** 2))
+            ss_tot = float(np.sum((ys - ys.mean()) ** 2))
+            if ss_tot > 1e-6 and lin_res > par_res:
+                r2_improvement = (lin_res - par_res) / ss_tot
+                parabolic_score = min(
+                    1.0, r2_improvement / self.airborne_parabolic_normaliser
+                )
+
+            # y-ratio gate: suppress score when ball barely moves vertically
+            y_range = float(ys.max() - ys.min())
+            x_range = float(xs.max() - xs.min())
+            motion_range = float(np.hypot(x_range, y_range))
+            if motion_range > 1e-3:
+                y_ratio = y_range / motion_range
+                parabolic_score *= min(1.0, y_ratio / self.airborne_min_y_ratio)
+
+        # --- Signal 4: foot baseline elevation ---
+        # Elevation = how far above nearby player feet the ball center sits,
+        # normalised by average player height.  A ground ball sits at foot level
+        # (signal ≈ 0); a ball at player-head height gives signal ≈ 1.0.
+        foot_signal = 0.0
+        foot_signal_available = False
+        if self._last_players is not None and len(self._last_players) > 0:
+            ball_x, ball_y = positions[-1]
+            player_cx = (
+                (self._last_players.xyxy[:, 0] + self._last_players.xyxy[:, 2]) / 2
+            )
+            feet_y = self._last_players.xyxy[:, 3]
+            player_heights = (
+                self._last_players.xyxy[:, 3] - self._last_players.xyxy[:, 1]
+            )
+            nearby = np.abs(player_cx - ball_x) < self.foot_nearby_px
+            if np.sum(nearby) > 0:
+                avg_height = float(np.mean(player_heights[nearby]))
+                if avg_height > 0:
+                    ground_y = float(np.median(feet_y[nearby]))
+                    # positive when ball is above foot line (y decreases upward)
+                    elevation_px = ground_y - ball_y
+                    foot_signal = float(
+                        min(1.0, max(0.0, elevation_px / avg_height))
+                    )
+                    foot_signal_available = True
+
+        # --- Signal 6: homography pitch-space displacement ---
+        # When the ball is elevated, the ground-plane homography projects it to
+        # the wrong pitch position.  That projected position drifts away from
+        # where nearby players' feet land in pitch space.  The gap is small
+        # (< homography_ground_cm) for a ground ball and large
+        # (> homography_elevated_cm) for a clearly elevated one.
+        homography_signal = 0.0
+        homography_signal_available = False
+        if (
+            self._last_transformer is not None
+            and self._last_players is not None
+            and len(self._last_players) > 0
+        ):
+            ball_x, ball_y = positions[-1]
+            player_cx = (
+                (self._last_players.xyxy[:, 0] + self._last_players.xyxy[:, 2]) / 2
+            )
+            feet_y = self._last_players.xyxy[:, 3]
+            nearby = (
+                (np.abs(player_cx - ball_x) < self.homography_nearby_px) &
+                (np.abs(feet_y - ball_y) < self.homography_nearby_px * 1.2)
+            )
+            if np.sum(nearby) > 0:
+                try:
+                    nearby_feet = np.stack(
+                        [player_cx[nearby], feet_y[nearby]], axis=1
+                    ).astype(np.float32)
+                    ball_img = np.array([[ball_x, ball_y]], dtype=np.float32)
+                    player_feet_pitch = self._last_transformer.transform_points(
+                        nearby_feet
+                    )
+                    ball_pitch = self._last_transformer.transform_points(ball_img)[0]
+                    dists = np.linalg.norm(player_feet_pitch - ball_pitch, axis=1)
+                    min_dist = float(np.min(dists))
+                    span = self.homography_elevated_cm - self.homography_ground_cm
+                    homography_signal = float(
+                        min(1.0, max(0.0, (min_dist - self.homography_ground_cm) / span))
+                    )
+                    homography_signal_available = True
+                except (ValueError, cv2.error):
+                    pass
+
+        # --- Weighted combination (dynamic) ---
+        # Base signals always present; conditional signals appended only when
+        # available so the total is always renormalised to 1.0 and the
+        # threshold stays stable regardless of which signals fire.
+        components: list[tuple[float, float]] = [
+            (0.15, up_ratio),
+            (0.05, speed_score),
+            (0.80, parabolic_score),
+        ]
+        if foot_signal_available:
+            components.append((0.30, foot_signal))
+        if homography_signal_available:
+            components.append((0.20, homography_signal))
+
+        total_w = sum(w for w, _ in components)
+        score = sum(w * s for w, s in components) / total_w
+
+        # --- Temporal smoothing ---
+        # Average over recent frames to suppress per-frame detection noise.
+        self._score_history.append(score)
+        smoothed = float(np.mean(self._score_history))
+
+        # --- Hysteresis ---
+        # Higher bar to enter airborne; lower bar to exit.
+        # Prevents flickering at kick/landing transition points.
+        if self._is_airborne_state:
+            self._is_airborne_state = smoothed >= self.airborne_exit_threshold
         else:
-            accel_score = 0.0
+            self._is_airborne_state = smoothed >= self.airborne_score_threshold
 
-        # --- Signal 4: trajectory curvature ---
-        # Airborne balls arc (deviate from straight line between endpoints).
-        # Rolling balls travel roughly straight.
-        if len(positions) >= 3:
-            start = np.array(positions[0])
-            end = np.array(positions[-1])
-            line_vec = end - start
-            line_len = float(np.linalg.norm(line_vec))
-            if line_len > 1e-6:
-                deviations = []
-                for pos in positions[1:-1]:
-                    pt = np.array(pos) - start
-                    proj = np.dot(pt, line_vec) / (line_len ** 2)
-                    closest = start + proj * line_vec
-                    dev = float(np.linalg.norm(np.array(pos) - closest))
-                    deviations.append(dev)
-                max_deviation = max(deviations) if deviations else 0.0
-                curve_score = min(1.0, max_deviation / self.airborne_curve_threshold)
-            else:
-                curve_score = 0.0
-        else:
-            curve_score = 0.0
-
-        # --- Weighted combination ---
-        # Speed is intentionally near-zero: football is always fast so speed
-        # alone is meaningless. Curvature and acceleration are the real signals.
-        score = (
-            0.15 * up_ratio    +   # upward motion
-            0.05 * speed_score +   # speed (near-zero — football always fast)
-            0.40 * accel_score +   # parabolic acceleration = strongest airborne signal
-            0.40 * curve_score     # curved path = strongest airborne signal
-        )
-
-        return score >= self.airborne_score_threshold
+        return self._is_airborne_state
 
     @staticmethod
     def get_player_duel_points(detections: sv.Detections) -> np.ndarray:
@@ -481,6 +591,9 @@ class AerialDuelDetector:
         players_team_id: np.ndarray | None = None,
         transformer: ViewTransformer | None = None,
     ) -> tuple[bool, sv.Detections, np.ndarray | None]:
+        self._last_players = players
+        self._last_transformer = transformer
+
         ball_center = self.get_ball_center(ball_tracker)
 
         if ball_center is None:
@@ -918,11 +1031,16 @@ def run_aerial_duel(source_video_path: str, device: str) -> Iterator[np.ndarray]
         latch_frames=4,
         airborne_min_frames=5,
         # Airborne tuning:
-        # - lower airborne_score_threshold if airborne balls show "ON GROUND"
-        # - raise airborne_curve_threshold if straight kicks trigger "IN AIR"
+        # - raise airborne_score_threshold to reduce false positives (ground→IN AIR)
+        # - lower airborne_exit_threshold to exit airborne state sooner after landing
+        # - lower airborne_parabolic_normaliser to detect weaker/shorter arcs
+        # - raise airborne_score_window for smoother but slower-responding label
         airborne_speed_normaliser=12.0,
-        airborne_curve_threshold=25.0,   # raised: football travels straighter than expected
-        airborne_score_threshold=0.55,   # raised: require stronger signal to call airborne
+        airborne_parabolic_normaliser=0.15,
+        airborne_min_y_ratio=0.20,
+        airborne_score_threshold=0.55,
+        airborne_exit_threshold=0.30,
+        airborne_score_window=5,
     )
 
     duel_outcome_tracker = DuelOutcomeTracker(
