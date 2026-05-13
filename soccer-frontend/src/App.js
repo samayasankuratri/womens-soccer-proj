@@ -9,6 +9,9 @@ function App() {
   const [dragOver, setDragOver] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
+  const [duelCount, setDuelCount] = useState(null);
+  const [possession, setPossession] = useState(null);
+  const [duelPositions, setDuelPositions] = useState([]);
   const fileInputRef = useRef(null);
   const progressInterval = useRef(null);
 
@@ -64,6 +67,7 @@ function App() {
       clearInterval(progressInterval.current);
       setProgress(100);
       setProgressLabel("Complete!");
+      setDuelCount(response.headers.get('X-Duel-Count'));
       setOutputUrl(URL.createObjectURL(blob));
     } catch (err) {
       clearInterval(progressInterval.current);
@@ -86,6 +90,9 @@ function App() {
     setError(null);
     setProgress(0);
     setProgressLabel("");
+    setDuelCount(null);
+    setPossession(null);
+    setDuelPositions([]);
   };
 
   return (
@@ -199,6 +206,66 @@ function App() {
           </div>
         )}
 
+        {/* Stats Panel — always visible */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"12px",marginTop:"24px",marginBottom:"8px"}}>
+          <div style={{padding:"20px",borderRadius:"16px",background:"#FF149315",border:"1px solid #FF149340",textAlign:"center"}}>
+            <div style={{fontSize:"11px",color:"#FF1493",letterSpacing:"1px",fontWeight:"600",marginBottom:"8px"}}>TEAM A POSSESSION</div>
+            <div style={{fontSize:"40px",fontWeight:"900",color:"#FF1493"}}>
+              {possession ? `${possession.teamA}%` : "—"}
+            </div>
+          </div>
+          <div style={{padding:"20px",borderRadius:"16px",background:"linear-gradient(135deg,#00d4ff15,#7b2ff715)",border:"1px solid #00d4ff30",textAlign:"center"}}>
+            <div style={{fontSize:"11px",color:"#00d4ff",letterSpacing:"1px",fontWeight:"600",marginBottom:"8px"}}>DUELS DETECTED</div>
+            <div style={{fontSize:"40px",fontWeight:"900",color:"#00d4ff"}}>
+              {duelCount !== null ? duelCount : "—"}
+            </div>
+          </div>
+          <div style={{padding:"20px",borderRadius:"16px",background:"#00BFFF15",border:"1px solid #00BFFF40",textAlign:"center"}}>
+            <div style={{fontSize:"11px",color:"#00BFFF",letterSpacing:"1px",fontWeight:"600",marginBottom:"8px"}}>TEAM B POSSESSION</div>
+            <div style={{fontSize:"40px",fontWeight:"900",color:"#00BFFF"}}>
+              {possession ? `${possession.teamB}%` : "—"}
+            </div>
+          </div>
+        </div>
+
+        {/* Duel Heatmap — always visible */}
+        <div style={{marginTop:"16px",marginBottom:"8px",padding:"20px",borderRadius:"16px",background:"#ffffff05",border:"1px solid #ffffff12"}}>
+          <div style={{fontSize:"11px",color:"#00d4ff",letterSpacing:"1px",fontWeight:"600",marginBottom:"16px"}}>DUEL HEATMAP</div>
+          <div style={{position:"relative",width:"100%"}}>
+            <svg viewBox="0 0 100 65" style={{width:"100%",borderRadius:"8px",background:"#1a3a1a",display:"block"}}>
+              {/* Field outline */}
+              <rect x="1" y="1" width="98" height="63" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Center line */}
+              <line x1="50" y1="1" x2="50" y2="64" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Center circle */}
+              <circle cx="50" cy="32.5" r="9" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              <circle cx="50" cy="32.5" r="0.8" fill="#ffffff25"/>
+              {/* Left penalty box */}
+              <rect x="1" y="16" width="16" height="33" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Left goal box */}
+              <rect x="1" y="24" width="6" height="17" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Right penalty box */}
+              <rect x="83" y="16" width="16" height="33" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Right goal box */}
+              <rect x="93" y="24" width="6" height="17" fill="none" stroke="#ffffff25" strokeWidth="0.5"/>
+              {/* Left penalty spot */}
+              <circle cx="11" cy="32.5" r="0.8" fill="#ffffff25"/>
+              {/* Right penalty spot */}
+              <circle cx="89" cy="32.5" r="0.8" fill="#ffffff25"/>
+              {/* Duel positions */}
+              {duelPositions.map((pos, i) => (
+                <circle key={i} cx={pos.x} cy={pos.y} r="3" fill="#00d4ff" fillOpacity="0.5" stroke="#00d4ff" strokeWidth="0.5"/>
+              ))}
+              {/* Placeholder text when no data */}
+              {duelPositions.length === 0 && (
+                <text x="50" y="35" textAnchor="middle" fill="#ffffff30" fontSize="4" fontFamily="Arial">
+                  Run analysis to generate heatmap
+                </text>
+              )}
+            </svg>
+          </div>
+        </div>
+
         {/* Side by Side Comparison */}
         {outputUrl && (
           <div style={{marginTop:"20px"}}>
@@ -208,7 +275,7 @@ function App() {
               <div style={{height:"1px",flex:1,background:"linear-gradient(90deg,#ffffff20,transparent)"}} />
             </div>
 
-            {/* Side by side */}
+            {/* Videos */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"16px",marginBottom:"20px"}}>
               <div>
                 <p style={{color:"#ffffff50",fontSize:"12px",letterSpacing:"1px",marginBottom:"8px"}}>ORIGINAL</p>
